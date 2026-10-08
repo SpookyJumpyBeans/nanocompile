@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import numpy as np
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -52,6 +54,39 @@ def import_nanoinfer() -> Path:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     return root
+
+
+def weights_by_name(model_weights) -> dict[str, np.ndarray]:
+    """nanoinfer's loaded ``ModelWeights``, keyed by checkpoint tensor name.
+
+    The compiler binds weights by the names in the safetensors file. nanoinfer
+    has already read and widened them to float32, so this reuses its arrays
+    rather than loading a second 2 GB copy: both engines see the same bytes.
+    """
+    fields = {
+        "input_layernorm.weight": "input_layernorm",
+        "post_attention_layernorm.weight": "post_attention_layernorm",
+        "self_attn.q_proj.weight": "q_proj_weight",
+        "self_attn.q_proj.bias": "q_proj_bias",
+        "self_attn.k_proj.weight": "k_proj_weight",
+        "self_attn.k_proj.bias": "k_proj_bias",
+        "self_attn.v_proj.weight": "v_proj_weight",
+        "self_attn.v_proj.bias": "v_proj_bias",
+        "self_attn.o_proj.weight": "o_proj_weight",
+        "mlp.gate_proj.weight": "gate_proj_weight",
+        "mlp.up_proj.weight": "up_proj_weight",
+        "mlp.down_proj.weight": "down_proj_weight",
+    }
+    weights = {
+        "model.embed_tokens.weight": model_weights.embed_tokens,
+        "model.norm.weight": model_weights.final_norm,
+    }
+    if not model_weights.tied:
+        weights["lm_head.weight"] = model_weights.lm_head
+    for index, layer in enumerate(model_weights.layers):
+        for suffix, field in fields.items():
+            weights[f"model.layers.{index}.{suffix}"] = getattr(layer, field)
+    return weights
 
 
 def nanoinfer_tiny() -> ModuleType:
