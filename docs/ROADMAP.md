@@ -23,15 +23,17 @@ rewrites it, and so on; nothing is thrown away.
   prompt and every decode step without being rebuilt. Shape inference works on
   these expressions and rejects a mismatch when the node is built, not when it
   runs.
-- About fifteen primitives, chosen so that everything above them is a
-  composition:
-  - elementwise: `add`, `sub`, `mul`, `div`, `max`, `neg`, `exp`, `sqrt`,
-    `reciprocal`, `where`, `cast`, comparisons
-  - reductions: `sum`, `max` over one axis
+- Primitives chosen so that everything above them is a composition. Planned
+  at about fifteen; built as 26, because `iota`, `dim`, `sin` and `cos` let
+  positions, the causal mask and the RoPE tables be computed inside the graph
+  rather than passed in:
+  - leaves: `input`, `weight`, `const`, `iota`, `dim`
+  - elementwise: `add`, `sub`, `mul`, `div`, `less_equal`, `where`, `neg`,
+    `exp`, `sqrt`, `reciprocal`, `sin`, `cos`, `cast`
+  - reductions: `reduce_sum`, `reduce_max` over one axis
   - movement: `reshape`, `permute`, `broadcast`, `slice`, `concat`
   - `matmul`, kept primitive because phases 4 and 6 schedule it specially
   - `gather`, for the embedding lookup
-  - graph inputs, named weights, constants
 - A frontend: tensor-like Python objects whose operators build nodes.
   `rms_norm`, `silu`, `softmax`, RoPE, grouped-query attention and the causal
   mask are frontend functions that decompose into primitives. That is what
