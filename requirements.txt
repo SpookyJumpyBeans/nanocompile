@@ -1,0 +1,3 @@
+# The compiler's only Python runtime dependency. It also needs a C compiler
+# (gcc) on PATH from phase 2 on; tools/check_env.py reports which one.
+numpy>=2.0

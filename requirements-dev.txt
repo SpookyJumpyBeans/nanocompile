@@ -1,0 +1,7 @@
+-r requirements.txt
+
+pytest>=8.0
+
+# nanoinfer is the correctness oracle and is not installed from here: it is a
+# checkout next to this one (or at NANOINFER_PATH), found by tests/oracle.py.
+# Its own runtime dependency is numpy, which is already above.

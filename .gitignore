@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Compiled kernels are a cache keyed by content hash, rebuilt on demand
+.nanocompile-cache/
+*.dll
+*.so
+*.dylib
+
+# Benchmark output is kept (it is the point), but scratch files are not
+bench/*.tmp
+scratch/
