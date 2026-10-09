@@ -84,6 +84,28 @@ def _check_weights(graph: Graph, weights: Mapping[str, np.ndarray]) -> None:
             )
 
 
+def check_arguments(
+    graph: Graph,
+    inputs: Mapping[str, np.ndarray],
+    weights: Mapping[str, np.ndarray],
+    bindings: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Validate a call's inputs and weights, and return the symbol bindings.
+
+    Shared with the generated-code runtime, so both backends accept and
+    reject exactly the same arguments with the same messages.
+    """
+    unknown = sorted(set(inputs) - set(graph.input_names))
+    missing = sorted(set(graph.input_names) - set(inputs))
+    if unknown or missing:
+        raise InterpreterError(f"inputs: missing {missing}, unexpected {unknown}")
+
+    bound = bind_symbols(graph, inputs, bindings)
+    _check_inputs(graph, inputs, bound)
+    _check_weights(graph, weights)
+    return bound
+
+
 def _value(d, bound: Mapping[str, int]) -> int:
     return d if isinstance(d, int) else d.evaluate(bound)
 
@@ -173,14 +195,7 @@ def run(
     Intermediates are dropped after their last use, so peak memory is the
     weights plus the live activations rather than every value ever computed.
     """
-    unknown = sorted(set(inputs) - set(graph.input_names))
-    missing = sorted(set(graph.input_names) - set(inputs))
-    if unknown or missing:
-        raise InterpreterError(f"inputs: missing {missing}, unexpected {unknown}")
-
-    bound = bind_symbols(graph, inputs, bindings)
-    _check_inputs(graph, inputs, bound)
-    _check_weights(graph, weights)
+    bound = check_arguments(graph, inputs, weights, bindings)
 
     last_use: dict[Node, int] = {}
     for index, node in enumerate(graph.nodes):

@@ -90,6 +90,10 @@ class Expr:
 
     # -- inspection --------------------------------------------------------
 
+    def terms(self) -> list[tuple[Monomial, int]]:
+        """``(monomial, coefficient)`` pairs, lowest degree first, deterministically."""
+        return sorted(self._terms.items(), key=lambda t: (len(t[0]), t[0]))
+
     @property
     def symbols(self) -> frozenset[str]:
         return frozenset(name for monomial in self._terms for name in monomial)
