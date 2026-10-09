@@ -71,7 +71,10 @@ rewrites it, and so on; nothing is thrown away.
 - A lowering for each primitive into one loop nest, one kernel per primitive.
   No fusion.
 - A C emitter, a gcc driver, and a content-hash cache of compiled libraries so
-  an unchanged kernel is never recompiled.
+  an unchanged kernel is never recompiled. Built per library rather than per
+  kernel: identical kernels are deduplicated, the 63 that remain compile
+  together in under 5 seconds, and loading 63 libraries would cost more than
+  recompiling one.
 - A ctypes runtime and a buffer planner that reuses intermediate buffers by
   liveness.
 - Symbolic dimensions become runtime arguments of the kernels.

@@ -26,7 +26,7 @@ tools use it, and `nanocompile/` never imports it.
 | Phase | What | State |
 |------:|------|-------|
 | 1 | Graph IR with symbolic shapes, Qwen2 in the frontend, reference interpreter; logits within 1e-3 of nanoinfer | **done**: bitwise identical to nanoinfer, tokens identical |
-| 2 | Loop IR, one kernel per primitive, C codegen through gcc; tokens identical to nanoinfer | not started |
+| 2 | Loop IR, one kernel per primitive, C codegen through gcc; tokens identical to nanoinfer | **done**: tokens identical, 0.97 tok/s naive baseline (6.0x slower) |
 | 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | not started |
 | 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | not started |
 | 5 | Autotuning over the schedule space, on a machine known to be noisy | not started |
@@ -78,6 +78,7 @@ not, and there the claim is bitwise.
 
 ```
 python -m bench.phase1
+python -m bench.phase2
 ```
 
 ### Phase 1: graph IR and reference interpreter
@@ -164,6 +165,103 @@ alternating the engines in one process is what keeps it meaningful.
 computed inside the graph from `past` and `seq`, instead of being handed in as
 inputs the driver has to keep consistent with the cache.
 
+### Phase 2: loop IR and naive C codegen
+
+Every compute primitive is lowered to one loop nest in a small loop IR,
+emitted as C, compiled by gcc into one shared library, and called over ctypes
+(`nanocompile/lower.py`, `codegen_c.py`, `runtime.py`). Movement primitives
+cost nothing: `reshape`, `permute`, `broadcast` and `slice` become strided
+views, so the `W.T` in every projection is the weight read with its strides
+swapped and a broadcast bias is a stride of zero. A reshape that a view cannot
+express gets an explicit `copy` kernel, counted like any other. All
+intermediates live in one arena, reused by liveness.
+
+To see what it generates: `python tools/dump_c.py --layers 1`.
+
+Correctness:
+
+| Check | Result |
+|---|---|
+| Every primitive vs the interpreter, `seq` in {1, 3, 7} | bitwise, except `exp`/`sin`/`cos` and sums (within 2e-6) |
+| Real model, greedy tokens, 24 per prompt | **identical to nanoinfer** on all 3 prompts |
+| Real model, logits | within 1e-3 (3.6e-4 observed) |
+| Compiling the same graph twice | byte-identical C |
+| Every pair of live buffers in the arena | never overlapping |
+
+Phase 1 was bitwise and this is not, for one reason: the generated matmul adds
+its products in index order, and NumPy hands the same matmul to BLAS, which
+does not. The compile flags rule out everything else that would change a
+result (`-ffp-contract=off` forbids fusing a multiply and an add into an FMA,
+and there is no `-ffast-math`, so no sum is reordered), which is why every
+elementwise kernel still matches bit for bit.
+
+One decode step, as compiled:
+
+| | |
+|---|---:|
+| Kernel calls per token | 1,514 |
+| Distinct kernels | 63 |
+| Compile, cold / cached | 4.98 s / 0.70 s |
+| Arena for all intermediates | 0.13 MB (10.22 MB without reuse) |
+
+63 distinct kernels for 1,514 calls is the 24 layers sharing code: a kernel is
+its loop IR, and two layers' kernels are the same IR. A 25th layer would add
+calls and no C.
+
+**Bytes moved per run**, counted exactly from the loop IR as a polynomial in
+the two symbols:
+
+```
+18966*past*seq + 18966*seq*seq + 417792*past + 16357208*seq + 1976743344
+```
+
+Each term says something:
+
+- **1,976,743,344**: every float32 weight, read exactly once. This is the
+  check that views work. If a single projection copied its transposed
+  weight, this term would grow by that weight's size twice over.
+- **417,792 per cached token**: the KV cache holds 24,576 bytes per token,
+  and each step moves **17x** that. The concat that appends the new key reads
+  and rewrites the whole history, and `repeat_kv` materializes seven copies of
+  every key and value for the attention matmuls to read back. Phase 3 can fold
+  the repeat into the matmul's indexing instead.
+- **16,357,208 per new token** and the `seq` products: activations and the
+  attention scores, which grow with the prompt.
+
+Speed, nanoinfer and the generated code alternating in one process, 3 rounds
+of 24 tokens:
+
+| | Median step | Min | Max | Decode |
+|---|---:|---:|---:|---:|
+| nanoinfer | 171.0 ms | 140.7 ms | 862.8 ms | 5.85 tok/s |
+| generated C | 1,031.9 ms | 970.1 ms | 1,276.2 ms | **0.97 tok/s** |
+
+**6.0x slower than nanoinfer**, with identical tokens. A profiled step shows
+where the time goes:
+
+| | |
+|---:|---|
+| 920.0 ms | matmul |
+| 9.6 ms | the other 1,297 kernel calls together |
+| 72.8 ms | outside the kernels: 1,514 ctypes calls from Python, the plan, input checks |
+
+**It is not the memory.** 2.0 GB in 1.03 s is 1.94 GB/s, a twelfth of the
+~24 GB/s nanoinfer's phase 4 measured this machine's decode step reaching. The
+matmul is bound by latency instead. Each output is `acc = acc + a * b` down a
+row of 896 or 4,864, and every add waits for the one before it, about 494
+million times per token. gcc could break that chain with several accumulators
+or vector lanes, but only by reordering the sum, and the flags forbid exactly
+that. Phase 4 reorders it deliberately, with the tolerance that costs.
+
+The 72.8 ms outside the kernels is Python calling 1,514 functions one at a
+time. It is the cost phase 7 removes by compiling the whole step into one
+call.
+
+**One change from the roadmap:** the compile cache works per library, not per
+kernel. The 63 distinct kernels compile together in under 5 seconds, and
+loading 63 separate libraries would cost more than recompiling the rare one
+that changed.
+
 ## Measuring
 
 Same rules as nanoinfer, for the same reason: this laptop has stalled for
@@ -199,10 +297,11 @@ pytest
 Tests that need the real 494M-parameter weights are marked `reference` and
 skip without them. `pytest -m "not slow"` runs everything else in seconds.
 
-To print the IR for one block at the real model's widths:
+To print the IR, and the C it compiles to, for one block at the real model's widths:
 
 ```
 python tools/dump_graph.py --layers 1
+python tools/dump_c.py --layers 1
 ```
 
 ## Layout
