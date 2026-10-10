@@ -67,7 +67,11 @@ class Load:
 
 @dataclass(frozen=True)
 class Binary:
-    """``add sub mul div max`` keep the operand dtype; ``le lt ne or`` give bool."""
+    """``add sub mul div idiv mod`` keep the operand dtype; ``le lt ne or`` give bool.
+
+    ``idiv`` and ``mod`` are integer index arithmetic, used only on
+    non-negative operands, where C's truncating division is floor division.
+    """
 
     op: str
     a: "Scalar"
@@ -134,6 +138,22 @@ def binary(op: str, a: Scalar, b: Scalar) -> Scalar:
         if op == "mul" and _is(b, 1):
             return a
     return Binary(op, a, b, dtype)
+
+
+def idiv(a: Scalar, b: Scalar) -> Scalar:
+    if _is(b, 1):
+        return a
+    if isinstance(a, Const) and isinstance(b, Const):
+        return Const(a.value // b.value, a.dtype)
+    return Binary("idiv", a, b, a.dtype)
+
+
+def mod(a: Scalar, b: Scalar) -> Scalar:
+    if _is(b, 1):
+        return Const(0, a.dtype)
+    if isinstance(a, Const) and isinstance(b, Const):
+        return Const(a.value % b.value, a.dtype)
+    return Binary("mod", a, b, a.dtype)
 
 
 def add(a: Scalar, b: Scalar) -> Scalar:

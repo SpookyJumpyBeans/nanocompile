@@ -48,8 +48,12 @@ C_TYPES = {
 
 CFLAGS = ("-O3", "-march=native", "-ffp-contract=off", "-fwrapv", "-fno-math-errno")
 
-_BINARY_C = {"add": "+", "sub": "-", "mul": "*", "div": "/", "le": "<=", "lt": "<", "ne": "!=", "or": "||"}
-_PRECEDENCE = {"or": 0, "le": 1, "lt": 1, "ne": 1, "add": 2, "sub": 2, "mul": 3, "div": 3}
+_BINARY_C = {
+    "add": "+", "sub": "-", "mul": "*", "div": "/", "idiv": "/", "mod": "%",
+    "le": "<=", "lt": "<", "ne": "!=", "or": "||",
+}
+_PRECEDENCE = {"or": 0, "le": 1, "lt": 1, "ne": 1, "add": 2, "sub": 2, "mul": 3, "div": 3, "idiv": 3, "mod": 3}
+_TIGHTEST = max(_PRECEDENCE.values()) + 1
 _UNARY_C = {"exp": "expf", "sqrt": "sqrtf", "sin": "sinf", "cos": "cosf"}
 
 PRELUDE = """\
@@ -102,7 +106,8 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
     if isinstance(x, L.Select):
         return f"({render_scalar(x.cond)} ? {render_scalar(x.a)} : {render_scalar(x.b)})"
     if isinstance(x, L.Unary):
-        a = render_scalar(x.a)
+        # The operand binds tighter than anything around it: -(a + b), not -a + b.
+        a = render_scalar(x.a, _TIGHTEST)
         if x.op == "neg":
             return f"(-{a})"
         if x.op == "reciprocal":
