@@ -38,8 +38,18 @@ def rand(rng, *shape, dtype=np.float32):
 
 
 def both(graph, inputs, weights=None):
+    """The interpreter's outputs, and the fused C's, after checking unfused C.
+
+    Fused and unfused code must agree bitwise (phase 3's gate: fusion moves
+    operations between kernels and never reorders them). Each is also held to
+    the interpreter by the caller.
+    """
     weights = weights or {}
-    return interpreter.run(graph, inputs, weights), CompiledGraph(graph)(inputs, weights)
+    fused = CompiledGraph(graph)(inputs, weights)
+    unfused = CompiledGraph(graph, fuse=False)(inputs, weights)
+    for name in fused:
+        np.testing.assert_array_equal(fused[name], unfused[name], err_msg=f"{name}: fused != unfused")
+    return interpreter.run(graph, inputs, weights), fused
 
 
 def assert_same(expected, actual, exact=True):
@@ -230,6 +240,15 @@ def test_every_primitive_is_tested_here():
 
 def primitives(graph):
     return [call.primitive for call in lower(graph).calls]
+
+
+def test_unary_minus_binds_its_whole_operand():
+    """-(a + b) must not print as -a + b; fusion is what first inlined a sum there."""
+    from nanocompile import loopir as L
+
+    total = L.binary("add", L.Var("a", f32), L.Var("b", f32))
+    assert codegen_c.render_scalar(L.Unary("neg", total, f32)) == "(-(a + b))"
+    assert codegen_c.render_scalar(L.Unary("reciprocal", total, f32)) == "(1.0f / (a + b))"
 
 
 def test_transposed_weight_is_read_in_place():
