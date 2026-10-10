@@ -26,7 +26,9 @@ import numpy as np
 from nanocompile import codegen_c
 from nanocompile.interpreter import check_arguments
 from nanocompile.ir import Graph
+from nanocompile.fusion import fuse as fuse_graph
 from nanocompile.lower import Buffer, Program, lower
+from nanocompile.passes import optimize
 from nanocompile.symbolic import Dim, evaluate_shape
 
 ALIGN = 64
@@ -108,12 +110,18 @@ _KERNEL_TYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(ctypes.c_void_p),
 
 
 class CompiledGraph:
-    """A graph lowered, compiled and loaded: call it like ``interpreter.run``."""
+    """A graph lowered, compiled and loaded: call it like ``interpreter.run``.
 
-    def __init__(self, graph: Graph) -> None:
+    ``fuse=True`` (the default) optimizes the graph and fuses it (phase 3);
+    ``fuse=False`` is phase 2's one kernel per primitive, kept as the baseline
+    fusion is measured against and tested bitwise against.
+    """
+
+    def __init__(self, graph: Graph, fuse: bool = True) -> None:
         started = time.perf_counter()
         self.graph = graph
-        self.program = lower(graph)
+        self.fused = fuse
+        self.program = fuse_graph(optimize(graph)) if fuse else lower(graph)
         self.source = codegen_c.render_library(self.program.kernels)
         self.library_path, self.cached = codegen_c.build_library(self.source)
         self.compile_seconds = time.perf_counter() - started
@@ -188,11 +196,17 @@ class CompiledGraph:
         return {name: outputs[name] for name in program.outputs}
 
     def _error(self, call, status: int, inputs, bound) -> KernelError:
-        if call.primitive == "gather":
-            table, ids = call.operands
+        """Explain a failed kernel from the graph node it came from.
+
+        The node, not the call's operand order: a fused gather may list its
+        operands in any order.
+        """
+        node = self.program.graph.nodes[call.node]
+        if node.op == "gather":
+            table, ids = node.inputs
             rows = table.shape[0] if isinstance(table.shape[0], int) else table.shape[0].evaluate(bound)
-            if ids.buffer.kind == "input":
-                values = np.asarray(inputs[ids.buffer.name])
+            if ids.op == "input":
+                values = np.asarray(inputs[ids.attrs["name"]])
                 bad = values[(values < 0) | (values >= rows)].flat[0]
                 return KernelError(f"gather index {bad} is outside 0..{rows - 1}")
             return KernelError(f"gather index outside 0..{rows - 1} (node %{call.node})")
@@ -202,13 +216,14 @@ class CompiledGraph:
 class CBackend:
     """A ``Runner`` for ``Qwen2``: compiles each graph once, on first use."""
 
-    def __init__(self) -> None:
+    def __init__(self, fuse: bool = True) -> None:
+        self.fuse = fuse
         self._compiled: dict[int, tuple[Graph, CompiledGraph]] = {}
 
     def compiled(self, graph: Graph) -> CompiledGraph:
         entry = self._compiled.get(id(graph))
         if entry is None or entry[0] is not graph:
-            entry = (graph, CompiledGraph(graph))
+            entry = (graph, CompiledGraph(graph, fuse=self.fuse))
             self._compiled[id(graph)] = entry
         return entry[1]
 

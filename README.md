@@ -27,7 +27,7 @@ tools use it, and `nanocompile/` never imports it.
 |------:|------|-------|
 | 1 | Graph IR with symbolic shapes, Qwen2 in the frontend, reference interpreter; logits within 1e-3 of nanoinfer | **done**: bitwise identical to nanoinfer, tokens identical |
 | 2 | Loop IR, one kernel per primitive, C codegen through gcc; tokens identical to nanoinfer | **done**: tokens identical, 0.97 tok/s naive baseline (6.0x slower) |
-| 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | not started |
+| 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | **done**: bitwise identical to unfused, 62 to 13 kernels per block, 1.18x faster |
 | 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | not started |
 | 5 | Autotuning over the schedule space, on a machine known to be noisy | not started |
 | 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | not started |
@@ -79,6 +79,7 @@ not, and there the claim is bitwise.
 ```
 python -m bench.phase1
 python -m bench.phase2
+python -m bench.phase3
 ```
 
 ### Phase 1: graph IR and reference interpreter
@@ -261,6 +262,123 @@ call.
 kernel. The 63 distinct kernels compile together in under 5 seconds, and
 loading 63 separate libraries would cost more than recompiling the rare one
 that changed.
+
+### Phase 3: fusion
+
+Two graph passes first, both bitwise: common subexpression elimination
+merges what the frontend repeats (every `+ eps` built its own constant,
+reshape and broadcast), and constant folding evaluates anything computed from
+constants alone. Then fusion (`nanocompile/fusion.py`) decides which values
+become buffers at all. Matmuls, gathers and outputs do. An elementwise value
+is inlined into the one kernel that consumes it and never stored; reductions
+fold into the kernel that reads them row by row; a matmul's bias, residual
+add or activation is applied as its result is stored. Index-only primitives
+never become buffers: a kernel reads through them with strides, a divide and
+modulo, or a select.
+
+Correctness:
+
+| Check | Result |
+|---|---|
+| Fused vs unfused C, every primitive test from phase 2 | **bitwise identical** |
+| Fused vs unfused C, whole model with cached steps and the cache itself | **bitwise identical** |
+| Real model, greedy tokens, 24 per prompt | identical to nanoinfer on all 3 prompts |
+| Optimized vs original graph in the interpreter | bitwise identical |
+
+Bitwise, not within a tolerance, because fusion moves operations between
+kernels and never reorders the ones that produce a value. A row kernel sums
+in the same order the separate reduce kernel did; a matmul epilogue adds the
+bias to the same finished accumulator. That makes "fused equals unfused" an
+exact test, and it caught a real bug while it was being written: the C
+printer rendered `-(a + b)` as `-a + b`, which phase 2 never exercised
+because a negation's operand had always been a single load.
+
+What a transformer block became:
+
+| | unfused | fused |
+|---|---:|---:|
+| Kernel calls per block | 62 | **13** |
+| Kernel calls per token | 1,514 | 319 |
+| Distinct kernels | 63 | 20 |
+
+The 13 per block are rms_norm, the q, k and v projections, RoPE on q and on
+k, attention scores, softmax, the context matmul, the output projection with
+its residual add, rms_norm, `gate` and `up` with SwiGLU, and the down
+projection with its residual add.
+
+Bytes moved per run, both counted from the loop IR:
+
+```
+unfused  18966*past*seq + 18966*seq*seq + 417792*past + 16357208*seq + 1976743344
+fused     5376*past*seq +  5376*seq*seq +  24576*past +  2644488*seq + 1976742656
+```
+
+- **`past`: 417,792 to 24,576 bytes per cached token**, and 24,576 is the
+  KV cache's own size per token. Each cached key and value is now read
+  exactly once per step, and a test asserts that equality. `repeat_kv` and
+  the per-layer `concat` became index arithmetic inside the attention
+  kernels: a key head is `h / 7`, the history and the new token are a select.
+- **`seq`: 6.2x less** per new token. Activations that used to be written by
+  one kernel and read by the next now live in registers.
+- **The constant term barely moved**, and that is the point it makes: it is
+  the weights, read once each, and fusion cannot shrink them. At a decode
+  step (`seq` = 1, `past` = 17) the total goes from 2.0005 GB to 1.9799 GB,
+  1% less. Decode was never limited by activation traffic.
+
+Speed, nanoinfer, unfused and fused C alternating in one process, 3 rounds of
+24 tokens:
+
+| | Median step | Min | Max | Decode |
+|---|---:|---:|---:|---:|
+| nanoinfer | 96.7 ms | 84.9 ms | 115.1 ms | 10.34 tok/s |
+| unfused C | 294.2 ms | 273.0 ms | 337.3 ms | 3.40 tok/s |
+| fused C | 249.3 ms | 223.3 ms | 294.5 ms | **4.01 tok/s** |
+
+**Fusion is 1.18x faster, and almost none of that is the bytes.** With 1%
+less traffic, the gain had to come from somewhere else, so I measured it
+directly at decode size:
+
+| `[1, 896]` against `[4864, 896]` weights | time |
+|---|---:|
+| one matmul, one accumulator | 2.79 ms |
+| `gate` and `up` fused, two accumulators | 3.32 ms |
+
+Twice the arithmetic in 1.19x the time. Phase 2 found the matmul bound by a
+chain of dependent adds; the fused kernel runs two independent chains in one
+loop, and the CPU overlaps them. Unfused, `gate` and `up` cost 2 x 2.79 ms
+per layer; fused they cost 3.32, which saves about 54 ms over 24 layers,
+roughly the whole measured gain of 45 ms. Phase 4 applies the same idea on
+purpose, with more accumulators and vector lanes.
+
+**These numbers are not comparable with phase 2's.** Both C paths and
+nanoinfer ran far faster in this session than in phase 2's (unfused C: 294 ms
+here, 1,032 ms there), and not by the same factor: unfused C over nanoinfer
+was 6.0x then and 3.0x now. The machine was loaded during phase 2's run. Only
+comparisons within one run mean anything, which is why every benchmark here
+alternates its engines.
+
+The fused patterns alone, against nanoinfer's NumPy on the same arrays
+(median of 200 calls, alternating):
+
+| Pattern | Shape | nanoinfer | fused C |
+|---|---|---:|---:|
+| rms_norm | [1, 896] | 11.2 us | 21.1 us |
+| rms_norm | [64, 896] | 52.8 us | 57.4 us |
+| silu(gate) * up | [1, 4864] | 18.4 us | 41.9 us |
+| silu(gate) * up | [64, 4864] | 4,418.7 us | **3,487.7 us** |
+| softmax | [14, 1, 128] | 20.8 us | 31.7 us |
+| softmax | [14, 64, 64] | 149.0 us | 414.3 us |
+
+Mostly a loss, and honestly so. At decode sizes a standalone compiled call
+pays about 20 us of Python argument checking and planning before its kernel
+runs, which these patterns do not have to spare; inside the model that cost
+is paid once per step, not per pattern. Only SwiGLU at prefill size wins,
+where one pass replaces NumPy's eight. Softmax loses badly: the row kernel
+computes `exp` twice per element (once for the sum, once for the output),
+and its max and sum loops are scalar, because the NaN-propagating max and
+the in-order sum cannot be vectorized without changing a result. The
+profile says none of this matters yet: of a 246 ms fused step, every
+non-matmul kernel together takes 0.3 ms.
 
 ## Measuring
 
