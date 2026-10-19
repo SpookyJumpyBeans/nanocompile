@@ -101,6 +101,8 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
         return f"s[{x.index}]"
     if isinstance(x, L.Load):
         return f"x{x.param}[{render_scalar(x.index)}]"
+    if isinstance(x, L.Local):
+        return f"{x.name}[{render_scalar(x.index)}]"
     if isinstance(x, L.Cast):
         return f"({C_TYPES[x.dtype]})({render_scalar(x.a)})"
     if isinstance(x, L.Select):
@@ -143,6 +145,17 @@ def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int) -> list[str]:
             lines.append(f"{pad}{stmt.var} = {render_scalar(stmt.value)};")
         elif isinstance(stmt, L.Fail):
             lines.append(f"{pad}if ({render_scalar(stmt.cond)}) return {stmt.code};")
+        elif isinstance(stmt, L.Array):
+            ctype = C_TYPES[stmt.init.dtype]
+            i = f"{stmt.name}_i"
+            lines.append(f"{pad}{ctype} {stmt.name}[{stmt.size}];")
+            lines.append(f"{pad}for (int64_t {i} = 0; {i} < {stmt.size}; ++{i}) {stmt.name}[{i}] = {_const(stmt.init)};")
+        elif isinstance(stmt, L.ArrayStore):
+            lines.append(f"{pad}{stmt.name}[{render_scalar(stmt.index)}] = {render_scalar(stmt.value)};")
+        elif isinstance(stmt, L.Block):
+            lines.append(f"{pad}{{")
+            lines.extend(_render_stmts(stmt.body, depth + 1))
+            lines.append(f"{pad}}}")
         else:
             raise TypeError(f"cannot render {stmt!r}")
     return lines
