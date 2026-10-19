@@ -29,6 +29,7 @@ from nanocompile.ir import Graph
 from nanocompile.fusion import fuse as fuse_graph
 from nanocompile.lower import Buffer, Program, lower
 from nanocompile.passes import optimize
+from nanocompile.schedule import schedule_program
 from nanocompile.symbolic import Dim, evaluate_shape
 
 ALIGN = 64
@@ -115,13 +116,18 @@ class CompiledGraph:
     ``fuse=True`` (the default) optimizes the graph and fuses it (phase 3);
     ``fuse=False`` is phase 2's one kernel per primitive, kept as the baseline
     fusion is measured against and tested bitwise against.
+
+    ``schedule``, if given, is called as ``schedule(kernel, calls)`` for each
+    distinct kernel and returns it scheduled (phase 4).
     """
 
-    def __init__(self, graph: Graph, fuse: bool = True) -> None:
+    def __init__(self, graph: Graph, fuse: bool = True, schedule=None) -> None:
         started = time.perf_counter()
         self.graph = graph
         self.fused = fuse
         self.program = fuse_graph(optimize(graph)) if fuse else lower(graph)
+        if schedule is not None:
+            self.program = schedule_program(self.program, schedule)
         self.source = codegen_c.render_library(self.program.kernels)
         self.library_path, self.cached = codegen_c.build_library(self.source)
         self.compile_seconds = time.perf_counter() - started
