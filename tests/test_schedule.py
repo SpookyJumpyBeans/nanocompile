@@ -13,7 +13,7 @@ import pytest
 from nanocompile import loopir as L
 from nanocompile import nn, runtime
 from nanocompile.dtypes import f32, i64
-from nanocompile.frontend import GraphBuilder, gather
+from nanocompile.frontend import GraphBuilder, concat, gather
 from nanocompile.fusion import fuse
 from nanocompile.passes import optimize
 from nanocompile.runtime import CompiledGraph
@@ -90,7 +90,7 @@ CASES = _cases()
 def check(name: str, schedule) -> CompiledGraph:
     """Run ``name`` plainly and scheduled at every size; require identical bits."""
     case = CASES[name]
-    plain = CompiledGraph(case.graph)
+    plain = CompiledGraph(case.graph, schedule=None)
     scheduled = CompiledGraph(case.graph, schedule=schedule)
     assert scheduled.source != plain.source, "the schedule changed nothing"
     rng = np.random.default_rng(len(name))
@@ -276,7 +276,7 @@ def test_integer_work_that_differs_by_lane_is_refused():
     i = L.Var("i")
     left = L.binary("lt", i, L.const(4))
     kernel = hand_kernel([L.Loop("i", L.const(8), (
-        L.Store(0, i, L.Select(left, L.Load(1, i, f32), L.const(0.0, f32), f32)),))])
+        L.Store(0, i, L.Select(left, L.const(1.0, f32), L.const(0.0, f32), f32)),))])
     with pytest.raises(ScheduleError, match="differ between lanes"):
         Schedule(kernel).vectorize("i")
 
@@ -285,6 +285,39 @@ def test_a_reduction_cannot_be_vectorized_without_reordering_it():
     (row_kernel,) = fuse(optimize(CASES["rms_norm"].graph)).kernels
     with pytest.raises(ScheduleError, match="carries acc0"):
         Schedule(row_kernel).split("r", 8).vectorize("ri")
+
+
+def concat_graph(axis):
+    """``concat(x, y) * 2`` where reading the wrong operand indexes out of bounds."""
+    b = GraphBuilder()
+    s = b.symbol("seq")
+    if axis == 0:
+        x, y = b.input("x", f32, (1, 16)), b.input("y", f32, (s, 16))
+    else:
+        x, y = b.input("x", f32, (s, 8)), b.input("y", f32, (s, 8))
+    return b.build({"z": concat([x, y], axis=axis) * 2.0})
+
+
+def test_a_concat_across_rows_loads_only_the_operand_it_needs():
+    """The KV cache's concat: one condition per row, so a branch, not a blend.
+
+    A blend would load both operands, and for a row of one the other's index
+    is outside its buffer. The real model crashed on exactly this before.
+    """
+    graph = concat_graph(axis=0)
+    plain = CompiledGraph(graph, schedule=None)
+    scheduled = CompiledGraph(graph, schedule=vectorize_innermost("i1"))
+    assert "_mm256_blendv_ps" not in scheduled.source
+    rng = np.random.default_rng(3)
+    for seq in (1, 5):
+        inputs = {"x": rand(rng, 1, 16), "y": rand(rng, seq, 16)}
+        np.testing.assert_array_equal(scheduled(inputs, {})["z"], plain(inputs, {})["z"])
+
+
+def test_a_concat_that_differs_by_lane_is_not_vectorized():
+    (kernel,) = fuse(optimize(concat_graph(axis=1))).kernels
+    with pytest.raises(ScheduleError, match="both of its branches"):
+        Schedule(kernel).split("i1", 8).vectorize("i1i")
 
 
 def test_vectorize_needs_exactly_eight_innermost_iterations():

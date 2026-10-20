@@ -13,7 +13,11 @@ loop produces:
   false for a NaN operand, ``!=`` is true.
 * ``exp``, ``sin`` and ``cos`` call the same C library function once per
   lane, since a vector approximation would round differently.
-* A select is a blend, which moves bits and computes nothing.
+* A select with one condition for all lanes is a C ``?:`` on vectors, which
+  evaluates only the chosen branch, as scalar C does; a ``concat`` depends on
+  that, since the branch not taken may index outside its operand. A select
+  whose condition differs by lane is a blend, which evaluates both branches,
+  so it is allowed only when neither branch reads an operand.
 
 Loads and stores are classified by the lane variable's coefficient in their
 index: 1 is a contiguous ``loadu``/``storeu``, 0 is one scalar broadcast to
@@ -179,6 +183,15 @@ class VectorLoop:
                 return f"_mm256_div_ps(_mm256_set1_ps(1.0f), {a})"
             return f"{_LANEWISE[x.op]}({a})"
         if isinstance(x, L.Select) and x.dtype == dtypes.f32:
+            if not self.varies(x.cond):
+                # One condition for every lane: choose, and evaluate only the
+                # chosen branch, as scalar C does. A concat relies on that: the
+                # branch not taken may index outside its operand.
+                return f"({self.scalar(x.cond)} ? {self.vec(x.a)} : {self.vec(x.b)})"
+            # Accumulators (locals) are always in bounds; an operand read in a
+            # branch may not be, when the condition is what keeps it in bounds.
+            if any(isinstance(n, L.Load) for branch in (x.a, x.b) for n in L.walk_scalar(branch)):
+                raise VectorError("a select that differs by lane would read both of its branches")
             return f"_mm256_blendv_ps({self.vec(x.b)}, {self.vec(x.a)}, {self.vec(x.cond)})"
         if isinstance(x, L.Cast) and x.dtype == dtypes.f32 and x.a.dtype == dtypes.f32:
             return self.vec(x.a)
