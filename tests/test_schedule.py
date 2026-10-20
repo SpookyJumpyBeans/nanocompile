@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from nanocompile import loopir as L
 from nanocompile import nn
 from nanocompile.dtypes import f32, i64
 from nanocompile.frontend import GraphBuilder, gather
@@ -150,6 +151,57 @@ def test_kernels_without_a_perfect_nest_refuse_every_reorder(name):
     for outer, inner in zip(loops, loops[1:]):
         with pytest.raises(ScheduleError):
             Schedule(kernel).reorder(outer, inner)
+
+
+COLUMNS = {"matmul+epilogue": 10, "swiglu": 9}
+
+
+def register_block(columns_per_block, rows_per_block):
+    """The matmul recipe without SIMD: column blocks outermost, rows blocked,
+    the block's columns and rows moved inside the k loop and unrolled."""
+    def schedule(kernel, calls):
+        s = Schedule(kernel)
+        s.split("i1", columns_per_block).reorder("i0", "i1o")
+        s.privatize("i1i")
+        s.split("i0", rows_per_block).privatize("i0i")
+        s.unroll("i0i").unroll("i1i")
+        return s.done()
+    return schedule
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3])
+@pytest.mark.parametrize("name", sorted(COLUMNS))
+def test_privatized_and_unrolled_register_blocks(name, rows):
+    # A column block that divides the width, so the column loops nest perfectly.
+    block = {10: 5, 9: 3}[COLUMNS[name]]
+    check(name, register_block(block, rows))
+
+
+@pytest.mark.parametrize("name", sorted(COLUMNS))
+def test_privatize_a_split_tail_too(name):
+    def schedule(kernel, calls):
+        s = Schedule(kernel).split("i1", 4)
+        s.privatize("i1i").privatize("i1t")
+        return s.done()
+    check(name, schedule)
+
+
+def test_privatize_moves_the_columns_inside_the_k_loop():
+    s = Schedule(matmul_kernel()).split("i1", 5).privatize("i1i")
+    (rows,) = s.kernel.body
+    (block,) = rows.body
+    array, reduction, epilogue = block.body
+    assert array == L.Array("acc0", 5, L.const(0.0, f32))
+    assert reduction.var == "k" and reduction.body[0].var == "i1i"
+    assert epilogue.var == "i1i"
+
+
+def test_privatize_needs_accumulators_and_a_constant_extent():
+    with pytest.raises(ScheduleError, match="not a constant"):
+        Schedule(matmul_kernel()).privatize("i0")
+    (row_kernel,) = fuse(optimize(CASES["rms_norm"].graph)).kernels
+    with pytest.raises(ScheduleError):
+        Schedule(row_kernel).split("j0", 4).privatize("j0i")
 
 
 # -- legality --------------------------------------------------------------------

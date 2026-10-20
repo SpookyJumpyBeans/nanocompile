@@ -105,6 +105,33 @@ def _rewrite(stmts, var: str, fn, found: list[int]) -> tuple[L.Stmt, ...]:
     return tuple(out)
 
 
+def _to_arrays(stmts, scalars: dict[str, L.Const], sizes: dict[str, int], j: L.Var) -> tuple[L.Stmt, ...]:
+    """Accumulator ``acc`` read and written as ``acc[j]``; array ``a`` of size n as ``a[j * n + i]``."""
+    def scalar(x: L.Scalar) -> L.Scalar:
+        if isinstance(x, L.Var) and x.name in scalars:
+            return L.Local(x.name, j, scalars[x.name].dtype)
+        if isinstance(x, L.Local) and x.name in sizes:
+            return L.Local(x.name, L.add(L.mul(j, L.const(sizes[x.name])), x.index), x.dtype)
+        return x
+
+    out: list[L.Stmt] = []
+    for s in stmts:
+        if isinstance(s, L.Loop):
+            out.append(replace(s, extent=L.map_scalar(s.extent, scalar), body=_to_arrays(s.body, scalars, sizes, j)))
+            continue
+        if isinstance(s, L.Block):
+            out.append(L.Block(_to_arrays(s.body, scalars, sizes, j)))
+            continue
+        (s,) = L.map_stmts((s,), scalar)
+        if isinstance(s, L.Assign) and s.var in scalars:
+            out.append(L.ArrayStore(s.var, j, s.value))
+        elif isinstance(s, L.ArrayStore) and s.name in sizes:
+            out.append(L.ArrayStore(s.name, L.add(L.mul(j, L.const(sizes[s.name])), s.index), s.value))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
 class Schedule:
     """A kernel being scheduled. Each method applies one transformation."""
 
@@ -186,6 +213,69 @@ class Schedule:
             return [L.Block(L.substitute(loop.body, {var: L.const(c)})) for c in range(int(loop.extent.value))]
 
         return self._apply(f"unroll {var}", var, fn)
+
+    def privatize(self, var: str) -> "Schedule":
+        """Move ``var`` inside the reduction loop it encloses, one accumulator per iteration.
+
+        ``var``'s body must be accumulators (scalars set to a constant, or
+        arrays), one reduction loop that updates only them, and an epilogue
+        that reads them::
+
+            for j in 0..8:                        acc = [0] * 8
+                acc = 0                           for k in 0..K:
+                for k in 0..K:            ->          for j in 0..8:
+                    acc = acc + a[k] * b[k, j]            acc[j] = acc[j] + a[k] * b[k, j]
+                out[j] = acc                      for j in 0..8:
+                                                      out[j] = acc[j]
+
+        Each accumulator is updated by the same operations in the same order;
+        only the loop that visits the accumulators has moved. Accumulators that
+        are already arrays (from privatizing an inner loop) grow by ``var``'s
+        extent, so the transformation stacks.
+        """
+        def fn(loop: L.Loop) -> list[L.Stmt]:
+            where = f"privatize {var}"
+            if not isinstance(loop.extent, L.Const):
+                raise ScheduleError(f"{where}: the extent is not a constant")
+            if loop.kind != "serial":
+                raise ScheduleError(f"{where}: the loop is {loop.kind}")
+            extent = int(loop.extent.value)
+            body = list(loop.body)
+            scalars: dict[str, L.Const] = {}
+            arrays: dict[str, L.Array] = {}
+            while body and isinstance(body[0], (L.Let, L.Array)):
+                decl = body.pop(0)
+                if isinstance(decl, L.Array):
+                    arrays[decl.name] = decl
+                elif isinstance(decl.value, L.Const):
+                    scalars[decl.var] = decl.value
+                else:
+                    raise ScheduleError(f"{where}: {decl.var} does not start from a constant")
+            if not scalars and not arrays:
+                raise ScheduleError(f"{where}: {var}'s body declares no accumulators")
+            if not body or not isinstance(body[0], L.Loop):
+                raise ScheduleError(f"{where}: no reduction loop follows the accumulators")
+            reduction, rest = body[0], tuple(body[1:])
+            if var in L.vars_of(reduction.extent):
+                raise ScheduleError(f"{where}: {reduction.var}'s extent depends on {var}")
+            accumulators = set(scalars) | set(arrays)
+            if _written(reduction.body) - _declared(reduction.body) - accumulators:
+                raise ScheduleError(f"{where}: the reduction updates something besides its accumulators")
+            if _written(rest) - _declared(rest):
+                raise ScheduleError(f"{where}: the epilogue carries a value between iterations")
+
+            j = L.Var(var)
+            decls: list[L.Stmt] = [L.Array(name, extent, init) for name, init in scalars.items()]
+            decls += [L.Array(a.name, extent * a.size, a.init) for a in arrays.values()]
+            sizes = {name: a.size for name, a in arrays.items()}
+            moved = _to_arrays(reduction.body, scalars, sizes, j)
+            epilogue = _to_arrays(rest, scalars, sizes, j)
+            out = decls + [replace(reduction, body=(L.Loop(var, loop.extent, moved),))]
+            if epilogue:
+                out.append(L.Loop(var, loop.extent, epilogue))
+            return out
+
+        return self._apply(f"privatize {var}", var, fn)
 
     # -- result ----------------------------------------------------------------
 
