@@ -64,6 +64,19 @@ def _cases() -> dict[str, Case]:
     ids = b.input("ids", i64, (b.symbol("seq"),))
     cases["gather"] = Case(b.build({"e": gather(b.weight("t", (6, 5)), ids)}), lambda rng, n: (
         {"ids": rng.integers(0, 6, size=n).astype(np.int64)}, {"t": rand(rng, 6, 5)}))
+
+    # Widths that are multiples of the vector width, for tiles with no tail.
+    b = GraphBuilder()
+    s = b.symbol("seq")
+    x, r = b.input("x", f32, (s, 12)), b.input("r", f32, (s, 32))
+    y = r + nn.linear(x, b.weight("w", (32, 12)), b.weight("b", (32,)))
+    cases["wide matmul"] = Case(b.build({"y": y}), lambda rng, n: (
+        {"x": rand(rng, n, 12), "r": rand(rng, n, 32)}, {"w": rand(rng, 32, 12), "b": rand(rng, 32)}))
+
+    b = GraphBuilder()
+    ids = b.input("ids", i64, (b.symbol("seq"),))
+    cases["wide gather"] = Case(b.build({"e": gather(b.weight("t", (6, 16)), ids)}), lambda rng, n: (
+        {"ids": rng.integers(0, 6, size=n).astype(np.int64)}, {"t": rand(rng, 6, 16)}))
     return cases
 
 
@@ -136,7 +149,7 @@ def test_split_then_unroll_the_innermost_loop(name, factor):
 
 # A row kernel's loops each hold more than one statement, and a gather's row
 # loop holds its bounds check, so neither has a pair of loops to swap.
-NOTHING_TO_REORDER = {"gather", "rms_norm"}
+NOTHING_TO_REORDER = {"gather", "wide gather", "rms_norm"}
 
 
 @pytest.mark.parametrize("name", sorted(set(CASES) - NOTHING_TO_REORDER))
@@ -202,6 +215,83 @@ def test_privatize_needs_accumulators_and_a_constant_extent():
     (row_kernel,) = fuse(optimize(CASES["rms_norm"].graph)).kernels
     with pytest.raises(ScheduleError):
         Schedule(row_kernel).split("j0", 4).privatize("j0i")
+
+
+# -- vectorization ---------------------------------------------------------------
+
+
+def vectorize_innermost(inner):
+    def schedule(kernel, calls):
+        return Schedule(kernel).split(inner, 8).vectorize(f"{inner}i").done()
+    return schedule
+
+
+@pytest.mark.parametrize("name, inner", [
+    ("elementwise", "i1"),      # 13 wide: one vector and a tail of 5
+    ("rms_norm", "j0"),         # the row's output loop; the sum stays scalar
+    ("softmax", "j0"),
+    ("wide gather", "j0"),
+])
+def test_vectorize_the_innermost_loop(name, inner):
+    compiled = check(name, vectorize_innermost(inner))
+    assert "_mm256_" in compiled.source
+
+
+@pytest.mark.parametrize("name", ["matmul+epilogue", "swiglu", "wide matmul"])
+def test_vectorize_privatized_columns(name):
+    def schedule(kernel, calls):
+        s = Schedule(kernel).split("i1", 8)
+        return s.privatize("i1i").vectorize("i1i").done()
+    check(name, schedule)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3])
+def test_a_register_tile_keeps_its_accumulators_in_registers(rows):
+    def schedule(kernel, calls):
+        s = Schedule(kernel)
+        s.split("i1", 32).reorder("i0", "i1o")
+        s.split("i1i", 8, outer="jv", inner="ji")
+        s.privatize("ji").privatize("jv")
+        s.split("i0", rows).privatize("i0i")
+        s.unroll("i0i").unroll("jv").vectorize("ji")
+        return s.done()
+    compiled = check("wide matmul", schedule)
+    # 4 column vectors per row, as registers, not a local array in memory.
+    assert f"acc0_{4 * rows - 1} = _mm256_set1_ps" in compiled.source
+    assert "_mm256_loadu_ps(&acc0" not in compiled.source
+
+
+def hand_kernel(body):
+    return L.Kernel("test", (L.Param(f32, True), L.Param(f32, False)), tuple(body))
+
+
+def test_the_lane_index_used_as_a_value_is_refused():
+    i = L.Var("i")
+    kernel = hand_kernel([L.Loop("i", L.const(8), (L.Store(0, i, L.Cast(i, f32)),))])
+    with pytest.raises(ScheduleError, match="no exact vector form|used as a value"):
+        Schedule(kernel).vectorize("i")
+
+
+def test_integer_work_that_differs_by_lane_is_refused():
+    i = L.Var("i")
+    left = L.binary("lt", i, L.const(4))
+    kernel = hand_kernel([L.Loop("i", L.const(8), (
+        L.Store(0, i, L.Select(left, L.Load(1, i, f32), L.const(0.0, f32), f32)),))])
+    with pytest.raises(ScheduleError, match="differ between lanes"):
+        Schedule(kernel).vectorize("i")
+
+
+def test_a_reduction_cannot_be_vectorized_without_reordering_it():
+    (row_kernel,) = fuse(optimize(CASES["rms_norm"].graph)).kernels
+    with pytest.raises(ScheduleError, match="carries acc0"):
+        Schedule(row_kernel).split("r", 8).vectorize("ri")
+
+
+def test_vectorize_needs_exactly_eight_innermost_iterations():
+    with pytest.raises(ScheduleError, match="split it to 8"):
+        Schedule(matmul_kernel()).vectorize("i1")
+    with pytest.raises(ScheduleError, match="innermost"):
+        Schedule(matmul_kernel()).split("i1", 8).vectorize("i1i")
 
 
 # -- legality --------------------------------------------------------------------

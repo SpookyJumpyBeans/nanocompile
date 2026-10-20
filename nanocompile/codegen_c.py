@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nanocompile import dtypes
+from nanocompile import codegen_avx2, dtypes
 from nanocompile import loopir as L
 
 C_TYPES = {
@@ -66,7 +66,7 @@ PRELUDE = """\
 #else
 #define NC_EXPORT __attribute__((visibility("default")))
 #endif
-"""
+""" + codegen_avx2.PRELUDE
 
 
 class CompileError(RuntimeError):
@@ -126,15 +126,29 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
     raise TypeError(f"cannot render {x!r}")
 
 
-def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int) -> list[str]:
+def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] | None = None) -> list[str]:
+    """C for ``stmts``. ``vector`` is ``None`` for scalar C, else the arrays kept in registers."""
     pad = "    " * depth
     lines: list[str] = []
-    for stmt in stmts:
-        if isinstance(stmt, L.Loop):
+    for position, stmt in enumerate(stmts):
+        if isinstance(stmt, L.Array) and vector is not None:
+            # From here to the end of this block, the name means this array.
+            vector = dict(vector)
+            vector.pop(stmt.name, None)
+            registers = codegen_avx2.registers_for(stmt, stmts[position + 1:])
+            if registers is not None:
+                vector[stmt.name] = registers
+                init = f"_mm256_set1_ps({_const(stmt.init)})"
+                names = ", ".join(f"{stmt.name}_{r} = {init}" for r in range(registers))
+                lines.append(f"{pad}__m256 {names};")
+                continue
+        if isinstance(stmt, L.Loop) and stmt.kind == "vector" and vector is not None:
+            lines.extend(codegen_avx2.VectorLoop(stmt, vector, render_scalar, C_TYPES).render(depth))
+        elif isinstance(stmt, L.Loop):
             lines.append(
                 f"{pad}for (int64_t {stmt.var} = 0; {stmt.var} < {render_scalar(stmt.extent)}; ++{stmt.var}) {{"
             )
-            lines.extend(_render_stmts(stmt.body, depth + 1))
+            lines.extend(_render_stmts(stmt.body, depth + 1, vector))
             lines.append(f"{pad}}}")
         elif isinstance(stmt, L.Store):
             lines.append(f"{pad}x0[{render_scalar(stmt.index)}] = {render_scalar(stmt.value)};")
@@ -154,7 +168,7 @@ def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int) -> list[str]:
             lines.append(f"{pad}{stmt.name}[{render_scalar(stmt.index)}] = {render_scalar(stmt.value)};")
         elif isinstance(stmt, L.Block):
             lines.append(f"{pad}{{")
-            lines.extend(_render_stmts(stmt.body, depth + 1))
+            lines.extend(_render_stmts(stmt.body, depth + 1, vector))
             lines.append(f"{pad}}}")
         else:
             raise TypeError(f"cannot render {stmt!r}")
@@ -167,11 +181,28 @@ def render_kernel(kernel: L.Kernel, name: str) -> str:
         ctype = C_TYPES[param.dtype]
         qualifier = "" if param.writable else "const "
         lines.append(f"    {qualifier}{ctype} *restrict x{i} = ({qualifier}{ctype} *)p[{i}];")
-    lines.extend(_render_stmts(kernel.body, 1))
+    if has_vector_loops(kernel.body):
+        # The scalar body is the same computation, for a compiler without AVX2.
+        lines.append("#if defined(__AVX2__)")
+        lines.extend(_render_stmts(kernel.body, 1, {}))
+        lines.append("#else")
+        lines.extend(_render_stmts(kernel.body, 1))
+        lines.append("#endif")
+    else:
+        lines.extend(_render_stmts(kernel.body, 1))
     lines.append("    (void)s;")
     lines.append("    return 0;")
     lines.append("}")
     return "\n".join(lines)
+
+
+def has_vector_loops(stmts) -> bool:
+    for s in stmts:
+        if isinstance(s, L.Loop) and (s.kind == "vector" or has_vector_loops(s.body)):
+            return True
+        if isinstance(s, L.Block) and has_vector_loops(s.body):
+            return True
+    return False
 
 
 def kernel_name(index: int) -> str:

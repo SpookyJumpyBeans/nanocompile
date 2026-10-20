@@ -25,8 +25,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from nanocompile import codegen_avx2, codegen_c
 from nanocompile import loopir as L
-from nanocompile.simplify import simplify_stmts
+from nanocompile.simplify import Simplifier, loop_ranges, simplify_stmts
 
 
 class ScheduleError(ValueError):
@@ -70,6 +71,36 @@ def independent(loop: L.Loop) -> bool:
     writes each output element once, at an index its loops determine.
     """
     return not (_written(loop.body) - _declared(loop.body))
+
+
+def _one_element_per_iteration(loop: L.Loop, name: str) -> bool:
+    """Whether every access to array ``name`` in ``loop`` is ``base + loop.var``, one base.
+
+    Then iteration ``l`` only ever touches element ``base + l``: a privatized
+    accumulator, updated in place, with nothing carried between iterations.
+    """
+    simplifier = Simplifier(loop_ranges((loop,)))
+    bases = set()
+    indices = [s.index for s in _array_stores(loop.body) if s.name == name]
+    indices += [x.index for x in L.scalars_of(loop.body) if isinstance(x, L.Local) and x.name == name]
+    if not indices or any(isinstance(s, L.Assign) and s.var == name for s in _all_stmts(loop.body)):
+        return False
+    for index in indices:
+        if simplifier.coefficient(index, loop.var) != 1:
+            return False
+        bases.add(L.substitute((L.Let("_", index),), {loop.var: L.const(0)})[0].value)
+    return len(bases) == 1
+
+
+def _all_stmts(stmts):
+    for s in stmts:
+        yield s
+        if isinstance(s, (L.Loop, L.Block)):
+            yield from _all_stmts(s.body)
+
+
+def _array_stores(stmts):
+    return [s for s in _all_stmts(stmts) if isinstance(s, L.ArrayStore)]
 
 
 def loop_vars(stmts) -> list[str]:
@@ -276,6 +307,33 @@ class Schedule:
             return out
 
         return self._apply(f"privatize {var}", var, fn)
+
+    def vectorize(self, var: str) -> "Schedule":
+        """Run ``var``'s eight iterations as the eight lanes of AVX2 instructions.
+
+        Split first: the loop must have exactly eight iterations, and be
+        innermost. Every lane computes the bits the scalar loop would, and a
+        body without an exact vector form is refused.
+        """
+        def fn(loop: L.Loop) -> list[L.Stmt]:
+            where = f"vectorize {var}"
+            if loop.kind != "serial":
+                raise ScheduleError(f"{where}: the loop is already {loop.kind}")
+            if not (isinstance(loop.extent, L.Const) and loop.extent.value == codegen_avx2.LANES):
+                raise ScheduleError(f"{where}: split it to {codegen_avx2.LANES} iterations first")
+            if loop_vars(loop.body):
+                raise ScheduleError(f"{where}: only an innermost loop can be vectorized")
+            for name in _written(loop.body) - _declared(loop.body):
+                if not _one_element_per_iteration(loop, name):
+                    raise ScheduleError(f"{where}: an iteration carries {name} into the next")
+            vector = replace(loop, kind="vector")
+            try:
+                codegen_avx2.check(vector, codegen_c.render_scalar, codegen_c.C_TYPES)
+            except codegen_avx2.VectorError as error:
+                raise ScheduleError(f"{where}: {error}") from None
+            return [vector]
+
+        return self._apply(f"vectorize {var}", var, fn)
 
     # -- result ----------------------------------------------------------------
 
