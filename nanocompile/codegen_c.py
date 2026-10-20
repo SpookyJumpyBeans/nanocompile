@@ -35,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nanocompile import dtypes
+from nanocompile import codegen_avx2, dtypes
 from nanocompile import loopir as L
 
 C_TYPES = {
@@ -66,7 +66,19 @@ PRELUDE = """\
 #else
 #define NC_EXPORT __attribute__((visibility("default")))
 #endif
-"""
+
+/* Parallel loops run on nanocompile's thread pool (pool.c), which the
+   runtime binds after loading. Unbound, they run in order on one thread. */
+typedef void (*nc_task)(void *, int64_t);
+typedef void (*nc_runner)(nc_task, void *, int64_t);
+typedef struct { void **p; const int64_t *s; } nc_ctx;
+static nc_runner nc_run = 0;
+NC_EXPORT void nc_bind_pool(nc_runner run) { nc_run = run; }
+static inline void nc_parallel(nc_task fn, void *ctx, int64_t n) {
+    if (nc_run) { nc_run(fn, ctx, n); return; }
+    for (int64_t i = 0; i < n; ++i) fn(ctx, i);
+}
+""" + codegen_avx2.PRELUDE
 
 
 class CompileError(RuntimeError):
@@ -101,6 +113,8 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
         return f"s[{x.index}]"
     if isinstance(x, L.Load):
         return f"x{x.param}[{render_scalar(x.index)}]"
+    if isinstance(x, L.Local):
+        return f"{x.name}[{render_scalar(x.index)}]"
     if isinstance(x, L.Cast):
         return f"({C_TYPES[x.dtype]})({render_scalar(x.a)})"
     if isinstance(x, L.Select):
@@ -124,15 +138,73 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
     raise TypeError(f"cannot render {x!r}")
 
 
-def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int) -> list[str]:
+class _Outliner:
+    """Collects the functions a kernel's parallel loops are outlined into.
+
+    A parallel loop's body becomes ``static void f(void *ctx, int64_t i)``,
+    called by the pool once per iteration with the kernel's parameter and
+    symbol arrays in ``ctx``. Schedules only mark a kernel's top-level loops
+    parallel, so a body needs nothing else from the kernel around it.
+    """
+
+    def __init__(self, kernel: L.Kernel, name: str) -> None:
+        self.kernel = kernel
+        self.name = name
+        self.functions: list[str] = []
+
+    def add(self, loop: L.Loop, vector: dict[str, int] | None) -> str:
+        fn = f"{self.name}_p{len(self.functions)}"
+        lines = [f"static void {fn}(void *nc_c, int64_t {loop.var}) {{",
+                 "    void **p = ((nc_ctx *)nc_c)->p;",
+                 "    const int64_t *s = ((nc_ctx *)nc_c)->s;"]
+        lines += _param_lines(self.kernel.params)
+        lines += _render_stmts(loop.body, 1, vector)
+        lines += ["    (void)p;", "    (void)s;", "}"]
+        self.functions.append("\n".join(lines))
+        return fn
+
+
+def _param_lines(params) -> list[str]:
+    lines = []
+    for i, param in enumerate(params):
+        ctype = C_TYPES[param.dtype]
+        qualifier = "" if param.writable else "const "
+        lines.append(f"    {qualifier}{ctype} *restrict x{i} = ({qualifier}{ctype} *)p[{i}];")
+    return lines
+
+
+def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] | None = None,
+                  outline: _Outliner | None = None) -> list[str]:
+    """C for ``stmts``.
+
+    ``vector`` is ``None`` for scalar C, else the arrays kept in registers;
+    ``outline`` collects parallel loops' bodies as functions.
+    """
     pad = "    " * depth
     lines: list[str] = []
-    for stmt in stmts:
-        if isinstance(stmt, L.Loop):
+    for position, stmt in enumerate(stmts):
+        if isinstance(stmt, L.Array) and vector is not None:
+            # From here to the end of this block, the name means this array.
+            vector = dict(vector)
+            vector.pop(stmt.name, None)
+            registers = codegen_avx2.registers_for(stmt, stmts[position + 1:])
+            if registers is not None:
+                vector[stmt.name] = registers
+                init = f"_mm256_set1_ps({_const(stmt.init)})"
+                names = ", ".join(f"{stmt.name}_{r} = {init}" for r in range(registers))
+                lines.append(f"{pad}__m256 {names};")
+                continue
+        if isinstance(stmt, L.Loop) and stmt.kind == "vector" and vector is not None:
+            lines.extend(codegen_avx2.VectorLoop(stmt, vector, render_scalar, C_TYPES).render(depth))
+        elif isinstance(stmt, L.Loop) and stmt.kind == "parallel" and outline is not None:
+            fn = outline.add(stmt, vector)
+            lines += [f"{pad}{{", f"{pad}    nc_ctx nc_c = {{p, s}};",
+                      f"{pad}    nc_parallel({fn}, &nc_c, {render_scalar(stmt.extent)});", f"{pad}}}"]
+        elif isinstance(stmt, L.Loop):
             lines.append(
                 f"{pad}for (int64_t {stmt.var} = 0; {stmt.var} < {render_scalar(stmt.extent)}; ++{stmt.var}) {{"
             )
-            lines.extend(_render_stmts(stmt.body, depth + 1))
+            lines.extend(_render_stmts(stmt.body, depth + 1, vector))
             lines.append(f"{pad}}}")
         elif isinstance(stmt, L.Store):
             lines.append(f"{pad}x0[{render_scalar(stmt.index)}] = {render_scalar(stmt.value)};")
@@ -143,22 +215,51 @@ def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int) -> list[str]:
             lines.append(f"{pad}{stmt.var} = {render_scalar(stmt.value)};")
         elif isinstance(stmt, L.Fail):
             lines.append(f"{pad}if ({render_scalar(stmt.cond)}) return {stmt.code};")
+        elif isinstance(stmt, L.Array):
+            ctype = C_TYPES[stmt.init.dtype]
+            i = f"{stmt.name}_i"
+            lines.append(f"{pad}{ctype} {stmt.name}[{stmt.size}];")
+            lines.append(f"{pad}for (int64_t {i} = 0; {i} < {stmt.size}; ++{i}) {stmt.name}[{i}] = {_const(stmt.init)};")
+        elif isinstance(stmt, L.ArrayStore):
+            lines.append(f"{pad}{stmt.name}[{render_scalar(stmt.index)}] = {render_scalar(stmt.value)};")
+        elif isinstance(stmt, L.Block):
+            lines.append(f"{pad}{{")
+            lines.extend(_render_stmts(stmt.body, depth + 1, vector))
+            lines.append(f"{pad}}}")
         else:
             raise TypeError(f"cannot render {stmt!r}")
     return lines
 
 
 def render_kernel(kernel: L.Kernel, name: str) -> str:
-    lines = [f"/* {kernel.primitive} */", f"NC_EXPORT int32_t {name}(void **p, const int64_t *s) {{"]
-    for i, param in enumerate(kernel.params):
-        ctype = C_TYPES[param.dtype]
-        qualifier = "" if param.writable else "const "
-        lines.append(f"    {qualifier}{ctype} *restrict x{i} = ({qualifier}{ctype} *)p[{i}];")
-    lines.extend(_render_stmts(kernel.body, 1))
-    lines.append("    (void)s;")
-    lines.append("    return 0;")
-    lines.append("}")
+    def body(vector):
+        outline = _Outliner(kernel, name)
+        main = _render_stmts(kernel.body, 1, vector, outline)
+        return outline.functions, main
+
+    lines = [f"/* {kernel.primitive} */"]
+    signature = f"NC_EXPORT int32_t {name}(void **p, const int64_t *s) {{"
+    if has_vector_loops(kernel.body):
+        # The scalar body is the same computation, for a compiler without AVX2.
+        (vector_fns, vector_body), (scalar_fns, scalar_body) = body({}), body(None)
+        if vector_fns:
+            lines += ["#if defined(__AVX2__)", *vector_fns, "#else", *scalar_fns, "#endif"]
+        lines += [signature, *_param_lines(kernel.params),
+                  "#if defined(__AVX2__)", *vector_body, "#else", *scalar_body, "#endif"]
+    else:
+        functions, main = body(None)
+        lines += [*functions, signature, *_param_lines(kernel.params), *main]
+    lines += ["    (void)p;", "    (void)s;", "    return 0;", "}"]
     return "\n".join(lines)
+
+
+def has_vector_loops(stmts) -> bool:
+    for s in stmts:
+        if isinstance(s, L.Loop) and (s.kind == "vector" or has_vector_loops(s.body)):
+            return True
+        if isinstance(s, L.Block) and has_vector_loops(s.body):
+            return True
+    return False
 
 
 def kernel_name(index: int) -> str:
@@ -204,13 +305,13 @@ def _library_suffix() -> str:
     return {"win32": ".dll", "darwin": ".dylib"}.get(sys.platform, ".so")
 
 
-def library_key(source: str) -> str:
+def library_key(source: str, extra_flags: tuple[str, ...] = ()) -> str:
     cc = compiler()
-    material = "\n".join([source, " ".join(CFLAGS), _compiler_identity(cc)])
+    material = "\n".join([source, " ".join(CFLAGS + extra_flags), _compiler_identity(cc)])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
-def build_library(source: str) -> tuple[Path, bool]:
+def build_library(source: str, extra_flags: tuple[str, ...] = ()) -> tuple[Path, bool]:
     """Compile ``source`` to a shared library, or find it in the cache.
 
     Returns the library path and whether it was already cached. The library is
@@ -218,7 +319,7 @@ def build_library(source: str) -> tuple[Path, bool]:
     compile never leaves a truncated library where the cache will find it.
     """
     cc = compiler()
-    path = cache_dir() / f"nc_{library_key(source)}{_library_suffix()}"
+    path = cache_dir() / f"nc_{library_key(source, extra_flags)}{_library_suffix()}"
     if path.exists():
         return path, True
 
@@ -229,7 +330,7 @@ def build_library(source: str) -> tuple[Path, bool]:
         # -static-libgcc on Windows so the DLL depends on nothing outside the
         # OS; -fPIC elsewhere because a shared object requires it.
         platform_flags = ["-static-libgcc"] if sys.platform == "win32" else ["-fPIC"]
-        command = [cc, *CFLAGS, *platform_flags, "-shared", "-o", str(out), str(src)]
+        command = [cc, *CFLAGS, *extra_flags, *platform_flags, "-shared", "-o", str(out), str(src)]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             raise CompileError(f"gcc failed:\n{result.stderr[-4000:]}")

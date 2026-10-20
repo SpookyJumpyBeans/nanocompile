@@ -17,9 +17,12 @@ costs phase 7 removes by owning the cache.
 from __future__ import annotations
 
 import ctypes
+import os
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -29,13 +32,55 @@ from nanocompile.ir import Graph
 from nanocompile.fusion import fuse as fuse_graph
 from nanocompile.lower import Buffer, Program, lower
 from nanocompile.passes import optimize
+from nanocompile.schedule import schedule_program
+from nanocompile import schedules
 from nanocompile.symbolic import Dim, evaluate_shape
 
 ALIGN = 64
 
+# Threads for parallel loops, the caller included, unless NANOCOMPILE_THREADS
+# says otherwise. Six is the measured best on this machine's six P-cores
+# (bench/phase4.py's sweep): a decode step reads its weights at the memory
+# bandwidth six threads already reach, and more threads land on E-cores or on
+# the hyperthread siblings of the thread that runs Python between kernels.
+DEFAULT_THREADS = 6
+
 
 class KernelError(RuntimeError):
     """A kernel rejected its input (an out-of-range gather index)."""
+
+
+# -- the thread pool -------------------------------------------------------------
+#
+# One pool per process, in its own small library, shared by every compiled
+# graph: two libraries with pools of their own would have two sets of workers
+# spinning against each other.
+
+_POOL: ctypes.CDLL | None = None
+
+
+def _pool() -> ctypes.CDLL:
+    global _POOL
+    if _POOL is None:
+        source = Path(__file__).with_name("pool.c").read_text(encoding="utf-8")
+        flags = () if sys.platform == "win32" else ("-pthread",)
+        path, _ = codegen_c.build_library(source, flags)
+        library = ctypes.CDLL(str(path))
+        library.nc_pool_set_threads.argtypes = [ctypes.c_int]
+        library.nc_pool_threads.restype = ctypes.c_int
+        configured = os.environ.get("NANOCOMPILE_THREADS")
+        library.nc_pool_set_threads(int(configured) if configured else DEFAULT_THREADS)
+        _POOL = library
+    return _POOL
+
+
+def set_threads(n: int) -> None:
+    """Threads that run parallel loops, the calling thread included."""
+    _pool().nc_pool_set_threads(n)
+
+
+def threads() -> int:
+    return _pool().nc_pool_threads()
 
 
 @dataclass(frozen=True)
@@ -115,18 +160,31 @@ class CompiledGraph:
     ``fuse=True`` (the default) optimizes the graph and fuses it (phase 3);
     ``fuse=False`` is phase 2's one kernel per primitive, kept as the baseline
     fusion is measured against and tested bitwise against.
+
+    ``schedule`` is how fused kernels are scheduled (phase 4): ``"default"``
+    for the hand-written recipes in ``schedules.py``, ``None`` for phase 3's
+    kernels as fusion wrote them, or a function called as
+    ``schedule(kernel, calls)`` for each distinct kernel. Unfused programs are
+    never scheduled; they are the baseline.
     """
 
-    def __init__(self, graph: Graph, fuse: bool = True) -> None:
+    def __init__(self, graph: Graph, fuse: bool = True, schedule="default") -> None:
         started = time.perf_counter()
         self.graph = graph
         self.fused = fuse
         self.program = fuse_graph(optimize(graph)) if fuse else lower(graph)
+        if schedule == "default":
+            schedule = schedules.default
+        if fuse and schedule is not None:
+            self.program = schedule_program(self.program, schedule)
         self.source = codegen_c.render_library(self.program.kernels)
         self.library_path, self.cached = codegen_c.build_library(self.source)
         self.compile_seconds = time.perf_counter() - started
 
         self._library = ctypes.CDLL(str(self.library_path))
+        bind = self._library.nc_bind_pool
+        bind.argtypes = [ctypes.c_void_p]
+        bind(ctypes.cast(_pool().nc_pool_run, ctypes.c_void_p))
         self._kernels = [
             _KERNEL_TYPE((codegen_c.kernel_name(i), self._library))
             for i in range(len(self.program.kernels))
@@ -134,6 +192,35 @@ class CompiledGraph:
         self._last_use = self.program.last_uses()
         self._arena = np.empty(0, dtype=np.uint8)
         self.last_plan: Plan | None = None
+        # Operands a kernel reads packed: (call, operand) -> rows per block.
+        self._packed_operands = {
+            (c, i): param.packed
+            for c, call in enumerate(self.program.calls)
+            for i, param in enumerate(self.program.kernels[call.kernel].params[1:])
+            if param.packed is not None
+        }
+        self._packs: dict[tuple[Buffer, int], tuple[np.ndarray, np.ndarray]] = {}
+        for (c, i) in self._packed_operands:
+            view = self.program.calls[c].operands[i]
+            if view.buffer.kind != "weight" or len(view.buffer.shape) != 2 or view.offset != 0:
+                raise ValueError(f"call {c} reads {view.buffer!r} packed; only whole 2-D weights can be")
+
+    def _packed(self, buf: Buffer, block: int, weights: Mapping[str, np.ndarray]) -> np.ndarray:
+        """``buf`` in the packed layout, made once per weight array and kept.
+
+        Weights are constants: the same array handed in again is the same
+        packed copy. A different array (new weights) is packed afresh.
+        """
+        if buf.kind != "weight":
+            raise TypeError(f"only weights are packed, not {buf!r}")
+        source = weights[buf.name]
+        entry = self._packs.get((buf, block))
+        if entry is None or entry[0] is not source:
+            rows, cols = source.shape
+            packed = np.ascontiguousarray(np.asarray(source).reshape(rows // block, block, cols).transpose(0, 2, 1))
+            entry = (source, packed)
+            self._packs[(buf, block)] = entry
+        return entry[1]
 
     def _arena_base(self, size: int) -> int:
         if self._arena.nbytes < size + ALIGN:
@@ -177,9 +264,13 @@ class CompiledGraph:
         for buf, offset in plan.offsets.items():
             addresses[buf] = arena + offset
 
-        for call in program.calls:
+        for c, call in enumerate(program.calls):
             pointers = [addresses[call.output]]
-            for view in call.operands:
+            for i, view in enumerate(call.operands):
+                block = self._packed_operands.get((c, i))
+                if block is not None:
+                    pointers.append(self._packed(view.buffer, block, weights).ctypes.data)
+                    continue
                 itemsize = view.dtype.numpy.itemsize
                 pointers.append(addresses[view.buffer] + _offset_bytes(view.offset, itemsize, bound))
             args = (ctypes.c_void_p * len(pointers))(*pointers)
@@ -216,14 +307,15 @@ class CompiledGraph:
 class CBackend:
     """A ``Runner`` for ``Qwen2``: compiles each graph once, on first use."""
 
-    def __init__(self, fuse: bool = True) -> None:
+    def __init__(self, fuse: bool = True, schedule="default") -> None:
         self.fuse = fuse
+        self.schedule = schedule
         self._compiled: dict[int, tuple[Graph, CompiledGraph]] = {}
 
     def compiled(self, graph: Graph) -> CompiledGraph:
         entry = self._compiled.get(id(graph))
         if entry is None or entry[0] is not graph:
-            entry = (graph, CompiledGraph(graph, fuse=self.fuse))
+            entry = (graph, CompiledGraph(graph, fuse=self.fuse, schedule=self.schedule))
             self._compiled[id(graph)] = entry
         return entry[1]
 

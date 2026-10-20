@@ -19,6 +19,12 @@ Everything is immutable and compared by value. That is what lets identical
 kernels from 24 identical layers be emitted once: two kernels are the same
 kernel exactly when their IR is equal.
 
+Schedules (phase 4) rewrite this IR and never leave it. A loop carries a
+``kind`` saying how it is to be run (in order, across threads, or as SIMD
+lanes), and accumulators that a schedule privatizes become small local arrays.
+Every scheduled kernel is still a plain loop nest with a meaning in scalar C,
+which is how each schedule is tested: against the same IR run as scalar code.
+
 The constructors fold constants and identities (``x * 1``, ``x + 0``,
 ``x * 0``) as they build. Index arithmetic is where nearly all of that
 happens, and generated C full of ``i1 * 1 + 0`` is harder to read and review
@@ -102,7 +108,16 @@ class Cast:
     dtype: DType
 
 
-Scalar = Const | Var | Sym | Load | Binary | Unary | Select | Cast
+@dataclass(frozen=True)
+class Local:
+    """Element ``index`` of the kernel-local array ``name``."""
+
+    name: str
+    index: "Scalar"
+    dtype: DType
+
+
+Scalar = Const | Var | Sym | Load | Binary | Unary | Select | Cast | Local
 
 COMPARISONS = frozenset({"le", "lt", "ne", "or"})
 
@@ -189,11 +204,23 @@ def linear_index(indices: list[Scalar], strides: tuple[Dim, ...], symbols: tuple
 # -- statements --------------------------------------------------------------
 
 
+LOOP_KINDS = ("serial", "parallel", "vector")
+
+
 @dataclass(frozen=True)
 class Loop:
+    """``for var in 0..extent``.
+
+    ``kind`` is how the iterations run: ``serial`` in order, ``parallel``
+    shared across threads, ``vector`` as the lanes of one SIMD instruction. A
+    schedule only marks a loop parallel or vector when its iterations are
+    independent, so every kind computes what ``serial`` does.
+    """
+
     var: str
     extent: Scalar
     body: tuple["Stmt", ...]
+    kind: str = "serial"
 
 
 @dataclass(frozen=True)
@@ -225,13 +252,45 @@ class Fail:
     code: int
 
 
-Stmt = Loop | Store | Let | Assign | Fail
+@dataclass(frozen=True)
+class Array:
+    """Declare the kernel-local array ``name``, every element set to ``init``."""
+
+    name: str
+    size: int
+    init: Const
+
+
+@dataclass(frozen=True)
+class ArrayStore:
+    name: str
+    index: Scalar
+    value: Scalar
+
+
+@dataclass(frozen=True)
+class Block:
+    """A nested scope. Unrolling makes one per copy, so their names never clash."""
+
+    body: tuple["Stmt", ...]
+
+
+Stmt = Loop | Store | Let | Assign | Fail | Array | ArrayStore | Block
 
 
 @dataclass(frozen=True)
 class Param:
+    """A kernel argument.
+
+    ``packed`` is set when the kernel reads a ``[rows, cols]`` operand in
+    blocks of ``packed`` rows, column-major within a block: element
+    ``(r, c)`` at ``(r / packed) * cols * packed + c * packed + r % packed``.
+    The runtime hands the kernel that layout, made once from the weight.
+    """
+
     dtype: DType
     writable: bool
+    packed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -269,3 +328,109 @@ def loop_nest(names: list[str], extents: list[Scalar], body: list[Stmt]) -> list
 def substitute_unit_loops(names: list[str], extents: list[Scalar]) -> list[Scalar]:
     """The index scalar for each loop: ``Var`` normally, ``0`` for unit loops."""
     return [Const(0, dtypes.i64) if _is(e, 1) else Var(n) for n, e in zip(names, extents)]
+
+
+# -- rewriting ---------------------------------------------------------------
+#
+# Schedules are rewrites of this IR. These are the traversals they share:
+# rebuilding a scalar bottom-up, applying that to every scalar in a block of
+# statements, and substituting expressions for loop variables. Rebuilding goes
+# through the folding constructors, so substituting a constant for a loop
+# variable folds the index arithmetic it lands in.
+
+
+def _rebuild_binary(op: str, a: Scalar, b: Scalar) -> Scalar:
+    if op == "idiv":
+        return idiv(a, b)
+    if op == "mod":
+        return mod(a, b)
+    return binary(op, a, b)
+
+
+def map_scalar(x: Scalar, f) -> Scalar:
+    """``x`` rebuilt bottom-up, each node replaced by ``f(node)``."""
+    if isinstance(x, Load):
+        x = Load(x.param, map_scalar(x.index, f), x.dtype)
+    elif isinstance(x, Local):
+        x = Local(x.name, map_scalar(x.index, f), x.dtype)
+    elif isinstance(x, Binary):
+        x = _rebuild_binary(x.op, map_scalar(x.a, f), map_scalar(x.b, f))
+    elif isinstance(x, Unary):
+        x = Unary(x.op, map_scalar(x.a, f), x.dtype)
+    elif isinstance(x, Select):
+        x = Select(map_scalar(x.cond, f), map_scalar(x.a, f), map_scalar(x.b, f), x.dtype)
+    elif isinstance(x, Cast):
+        x = Cast(map_scalar(x.a, f), x.dtype)
+    return f(x)
+
+
+def map_stmts(stmts, f) -> tuple[Stmt, ...]:
+    """Every scalar in ``stmts`` (loop extents included) rebuilt by ``map_scalar``."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop):
+            out.append(Loop(s.var, map_scalar(s.extent, f), map_stmts(s.body, f), s.kind))
+        elif isinstance(s, Store):
+            out.append(Store(s.param, map_scalar(s.index, f), map_scalar(s.value, f)))
+        elif isinstance(s, Let):
+            out.append(Let(s.var, map_scalar(s.value, f)))
+        elif isinstance(s, Assign):
+            out.append(Assign(s.var, map_scalar(s.value, f)))
+        elif isinstance(s, Fail):
+            out.append(Fail(map_scalar(s.cond, f), s.code))
+        elif isinstance(s, ArrayStore):
+            out.append(ArrayStore(s.name, map_scalar(s.index, f), map_scalar(s.value, f)))
+        elif isinstance(s, Block):
+            out.append(Block(map_stmts(s.body, f)))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def substitute(stmts, mapping: dict[str, Scalar]) -> tuple[Stmt, ...]:
+    """``stmts`` with each ``Var(name)`` in ``mapping`` replaced by its expression."""
+    def f(x: Scalar) -> Scalar:
+        return mapping.get(x.name, x) if isinstance(x, Var) else x
+    return map_stmts(stmts, f)
+
+
+def walk_scalar(x: Scalar):
+    """``x`` and every node below it, depth first."""
+    yield x
+    if isinstance(x, (Load, Local)):
+        yield from walk_scalar(x.index)
+    elif isinstance(x, Binary):
+        yield from walk_scalar(x.a)
+        yield from walk_scalar(x.b)
+    elif isinstance(x, (Unary, Cast)):
+        yield from walk_scalar(x.a)
+    elif isinstance(x, Select):
+        yield from walk_scalar(x.cond)
+        yield from walk_scalar(x.a)
+        yield from walk_scalar(x.b)
+
+
+def scalars_of(stmts):
+    """Every scalar node in ``stmts``, loop extents included, depth first."""
+    for s in stmts:
+        if isinstance(s, Loop):
+            yield from walk_scalar(s.extent)
+            yield from scalars_of(s.body)
+        elif isinstance(s, Block):
+            yield from scalars_of(s.body)
+        elif isinstance(s, (Store, ArrayStore)):
+            yield from walk_scalar(s.index)
+            yield from walk_scalar(s.value)
+        elif isinstance(s, (Let, Assign)):
+            yield from walk_scalar(s.value)
+        elif isinstance(s, Fail):
+            yield from walk_scalar(s.cond)
+
+
+def vars_of(x: Scalar) -> set[str]:
+    return {n.name for n in walk_scalar(x) if isinstance(n, Var)}
+
+
+def stmt_vars(stmts) -> set[str]:
+    """Names of every variable read anywhere in ``stmts``."""
+    return {n.name for n in scalars_of(stmts) if isinstance(n, Var)}
