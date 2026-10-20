@@ -28,7 +28,7 @@ tools use it, and `nanocompile/` never imports it.
 | 1 | Graph IR with symbolic shapes, Qwen2 in the frontend, reference interpreter; logits within 1e-3 of nanoinfer | **done**: bitwise identical to nanoinfer, tokens identical |
 | 2 | Loop IR, one kernel per primitive, C codegen through gcc; tokens identical to nanoinfer | **done**: tokens identical, 0.97 tok/s naive baseline (6.0x slower) |
 | 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | **done**: bitwise identical to unfused, 62 to 13 kernels per block, 1.18x faster |
-| 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | not started |
+| 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | **done**: bitwise identical to phase 3, 3.1x faster, matmul at the roofline (199 of 200.5 GFLOP/s) |
 | 5 | Autotuning over the schedule space, on a machine known to be noisy | not started |
 | 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | not started |
 | 7 | Whole-model compilation: one library, one call per token, a static memory plan | not started |
@@ -80,6 +80,7 @@ not, and there the claim is bitwise.
 python -m bench.phase1
 python -m bench.phase2
 python -m bench.phase3
+OPENBLAS_NUM_THREADS=6 python -m bench.phase4
 ```
 
 ### Phase 1: graph IR and reference interpreter
@@ -380,6 +381,144 @@ the in-order sum cannot be vectorized without changing a result. The
 profile says none of this matters yet: of a 246 ms fused step, every
 non-matmul kernel together takes 0.3 ms.
 
+### Phase 4: schedules
+
+Schedules are rewrites of the loop IR, kept apart from what a kernel computes
+(`nanocompile/schedule.py`): `split`, `reorder`, `unroll`, `privatize`,
+`vectorize`, `parallel` and `pack`. Each acts on loops by name, checks that it
+is legal where it applies, and raises otherwise. Each kernel class gets a
+hand-written recipe built from them (`nanocompile/schedules.py`), with
+fallbacks down to the kernel as fusion wrote it. Vector loops become AVX2
+(`codegen_avx2.py`), parallel loops run on a persistent thread pool
+(`pool.c`), and both are on by default.
+
+The roadmap expected this phase to vectorize the matmul by reordering its
+k sum, and to pay for that with a tolerance. It does not reorder anything.
+The parallelism comes from *across* outputs instead. A projection is tiled
+2 rows by 32 columns, and `privatize` moves the tile's 64 accumulators inside
+the k loop, where they are independent sums and sit in eight AVX2
+registers. Each output's sum still runs over k in order:
+
+```
+for jo in N / 32, in parallel:             32 output columns per task
+    for io in seq / 2:                      2 rows per tile
+        acc[2][4] = 0                       8 vector registers
+        for k in K:
+            a0, a1 = broadcast x[2io, k], x[2io+1, k]
+            for v in 0..3:                  w = packed W[jo*4 + v, k, 0..7]
+                acc[0][v] += a0 * w         one multiply, one add, no FMA
+                acc[1][v] += a1 * w
+        epilogue on the tile, 8 columns at a time
+```
+
+The weight is *packed* so the eight columns one vector covers are adjacent:
+row-major `W[j, k]` puts them 896 floats apart, and each vector would be
+eight scalar loads. The runtime packs each weight once, on first use. An
+index simplifier that knows loop ranges is what turns the packed index back
+into `base + lane`, so the vectorizer sees a contiguous load. A decode step
+has one row, so it runs the tile's one-row tail, four vectors wide.
+
+Correctness:
+
+| Check | Result |
+|---|---|
+| A grid of schedules over every kernel shape fusion emits, at sizes leaving every tail length | **bitwise identical** to the unscheduled kernel |
+| Every primitive test from phase 2, fused and scheduled vs unfused | **bitwise identical** |
+| Scheduled vs phase 3 model, real weights: prompt, cached decode steps and the cache | **bitwise identical** |
+| Parallel schedules at 1, 2, 3 and 8 threads | bitwise identical |
+| Real model, greedy tokens | identical to nanoinfer |
+
+Bitwise because no schedule reorders the operations behind a value, and AVX2
+renders each lane as the scalar code would: IEEE add, multiply, divide and
+square root are exactly rounded either way, FMA contraction stays off, and
+`exp`, `sin` and `cos` call the same libm function per lane. What has no
+exact vector form is refused: integer arithmetic that differs between lanes
+(RoPE's half-split, the causal mask's compare), a value carried between
+lanes, a reduction. Those kernels run scalar, in parallel where they can.
+
+The real model found a bug the tests had not. The attention context product
+reads V through the KV cache's concat, `t < past ? cache[t] : new[t - past]`.
+Scalar C loads only the branch it takes; the first AVX2 select was a blend,
+which loads both, and for `t < past` the new token's index is negative. The
+tiny test model never vectorized that kernel (its heads are 4 wide), and the
+real one crashed reading outside a buffer. A select whose condition every
+lane shares is now a C `?:` on vectors, and one whose condition differs by
+lane may only blend values that read no operand.
+
+**The machine**, measured on six threads by `bench/probe.c` with the
+instruction mix the kernels use: **34.5 GB/s** read bandwidth and
+**200.5 GFLOP/s** of multiply plus separate add. A decode step reads 1.98 GB
+of float32 weights, so 57 ms is the floor on a step, whatever the kernels do.
+
+Every matmul shape in the model, 24 copies of each weight read in turn so a
+decode-size call streams from memory as it does in a decode step (median per
+copy, alternating):
+
+| Shape | Rows | scheduled C | phase 3 C | NumPy | Rust int8 | roofline |
+|---|---:|---:|---:|---:|---:|---:|
+| q, o: 896 x 896 | 1 | 109 us | 746 us | 171 us | 77 us | 93 us |
+| k, v: 128 x 896 | 1 | 28 us | 107 us | 22 us | 70 us | 13 us |
+| gate, up: 4864 x 896 | 1 | 562 us | 4,088 us | 643 us | 454 us | 506 us |
+| down: 896 x 4864 | 1 | 714 us | 4,408 us | 730 us | 548 us | 506 us |
+| LM head: 151936 x 896 | 1 | 17.3 ms | 137.1 ms | 18.7 ms | 4.8 ms | 15.8 ms |
+| q, o: 896 x 896 | 64 | **546 us** | 38.3 ms | 816 us | | 513 us |
+| k, v: 128 x 896 | 64 | **125 us** | 5.8 ms | 305 us | | 73 us |
+| gate, up: 4864 x 896 | 64 | **3.02 ms** | 237.6 ms | 3.39 ms | | 2.78 ms |
+| down: 896 x 4864 | 64 | 3.64 ms | 272.5 ms | 3.50 ms | | 2.78 ms |
+| LM head: 151936 x 896 | 64 | **87.6 ms** | 7.71 s | 102.1 ms | | 86.9 ms |
+
+- **At 64 rows the tile is compute-bound and at the roofline.** The LM head
+  runs at **199.0 GFLOP/s against a measured peak of 200.5**, and the scheduled
+  kernels beat OpenBLAS on four of the five shapes, `down` being the one they
+  lose, by 4%. Against phase 3's scalar loops, the same arithmetic in the
+  same order is **46 to 88x faster**.
+- **At one row it is bound by memory, like everything else.** The large
+  shapes reach 91% of the read bandwidth (the LM head's 545 MB in 17.3 ms),
+  level with NumPy. The small ones (`q`, `k`) sit above the roofline: 28 us
+  of work per call is not much more than what the pool takes to start and
+  finish a task.
+- **nanoinfer's Rust kernel is faster at one row because it reads a quarter
+  of the bytes.** It is int8; this is float32. The roadmap's comparison is
+  not like for like until phase 6 makes the same trade.
+
+The model, nanoinfer, phase 3 and scheduled C alternating in one process,
+3 rounds of 24 tokens:
+
+| | Median step | Min | Max | Decode | Prefill |
+|---|---:|---:|---:|---:|---:|
+| nanoinfer | 103.6 ms | 77.5 ms | 289.3 ms | 9.65 tok/s | 270.0 ms |
+| phase 3 C | 343.5 ms | 323.4 ms | 392.7 ms | 2.91 tok/s | 1,664.5 ms |
+| scheduled C | 112.4 ms | 80.0 ms | 346.2 ms | **8.89 tok/s** | **92.2 ms** |
+
+**3.1x faster than phase 3, and level with nanoinfer within this machine's
+noise** (8% slower at the median, a similar minimum). Time to first token is
+**2.9x faster than nanoinfer's**, because prefill is where the tile's
+compute-bound rate counts. One profiled step:
+
+| | |
+|---:|---|
+| 94.7 ms | matmuls, at the memory bandwidth |
+| 0.8 ms | every other kernel together |
+| 13.2 ms | outside the kernels: 319 ctypes calls from Python |
+
+The step is now the weights' read time plus Python. What is left in the
+kernels is bytes, which phase 6 quarters. What is left outside them is the
+13 ms of Python, which phase 7 removes by compiling the step into one call.
+
+**Six threads.** The pool's default comes from a thread sweep of the decode
+step. 4 to 8 threads are one plateau within noise (two runs put the best at
+6 and at 8), since six already reach the memory bandwidth. Past 8 it gets
+steadily worse, to 3.3x slower at 20, as workers land on E-cores and on the
+hyperthread siblings of the thread that runs Python between kernels.
+
+**OpenBLAS was measured at six threads too**, and the results record it.
+Its default on this laptop is one thread per logical CPU, and at twenty it
+was erratic: the same `[64, 4864] @ [4864, 896]` took 2.6 ms on six threads
+and anywhere from 0.2 to 2.4 s on twenty, before nanocompile's pool existed
+in the process. A first run of this benchmark under that default showed
+NumPy almost 400x slower on `down` and a 72-second prefill for nanoinfer; it was
+discarded rather than published as a win.
+
 ## Measuring
 
 Same rules as nanoinfer, for the same reason: this laptop has stalled for
@@ -388,7 +527,7 @@ seconds at a time under sustained load.
 - Medians and minima, never means, with the spread printed beside them.
 - A/B comparisons alternate inside one process.
 - Head-to-head results are judged with an exact sign test over paired runs.
-- Thread counts and the machine are recorded with every result.
+- Thread counts and the machine are recorded with every result, BLAS's included.
 - Work (bytes moved, kernels launched, FLOPs) is counted exactly from the IR
   and asserted in tests. Wall time lives in `bench/`.
 
@@ -411,6 +550,9 @@ python -m venv .venv
 python tools/check_env.py
 pytest
 ```
+
+Parallel loops use six threads unless `NANOCOMPILE_THREADS` says otherwise
+(or `nanocompile.runtime.set_threads(n)` at run time).
 
 Tests that need the real 494M-parameter weights are marked `reference` and
 skip without them. `pytest -m "not slow"` runs everything else in seconds.
