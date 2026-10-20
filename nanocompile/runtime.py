@@ -39,8 +39,11 @@ from nanocompile.symbolic import Dim, evaluate_shape
 ALIGN = 64
 
 # Threads for parallel loops, the caller included, unless NANOCOMPILE_THREADS
-# says otherwise.
-DEFAULT_THREADS = 8
+# says otherwise. Six is the measured best on this machine's six P-cores
+# (bench/phase4.py's sweep): a decode step reads its weights at the memory
+# bandwidth six threads already reach, and more threads land on E-cores or on
+# the hyperthread siblings of the thread that runs Python between kernels.
+DEFAULT_THREADS = 6
 
 
 class KernelError(RuntimeError):
