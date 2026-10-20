@@ -33,6 +33,7 @@ from nanocompile.fusion import fuse as fuse_graph
 from nanocompile.lower import Buffer, Program, lower
 from nanocompile.passes import optimize
 from nanocompile.schedule import schedule_program
+from nanocompile import schedules
 from nanocompile.symbolic import Dim, evaluate_shape
 
 ALIGN = 64
@@ -157,16 +158,21 @@ class CompiledGraph:
     ``fuse=False`` is phase 2's one kernel per primitive, kept as the baseline
     fusion is measured against and tested bitwise against.
 
-    ``schedule``, if given, is called as ``schedule(kernel, calls)`` for each
-    distinct kernel and returns it scheduled (phase 4).
+    ``schedule`` is how fused kernels are scheduled (phase 4): ``"default"``
+    for the hand-written recipes in ``schedules.py``, ``None`` for phase 3's
+    kernels as fusion wrote them, or a function called as
+    ``schedule(kernel, calls)`` for each distinct kernel. Unfused programs are
+    never scheduled; they are the baseline.
     """
 
-    def __init__(self, graph: Graph, fuse: bool = True, schedule=None) -> None:
+    def __init__(self, graph: Graph, fuse: bool = True, schedule="default") -> None:
         started = time.perf_counter()
         self.graph = graph
         self.fused = fuse
         self.program = fuse_graph(optimize(graph)) if fuse else lower(graph)
-        if schedule is not None:
+        if schedule == "default":
+            schedule = schedules.default
+        if fuse and schedule is not None:
             self.program = schedule_program(self.program, schedule)
         self.source = codegen_c.render_library(self.program.kernels)
         self.library_path, self.cached = codegen_c.build_library(self.source)
@@ -298,14 +304,15 @@ class CompiledGraph:
 class CBackend:
     """A ``Runner`` for ``Qwen2``: compiles each graph once, on first use."""
 
-    def __init__(self, fuse: bool = True) -> None:
+    def __init__(self, fuse: bool = True, schedule="default") -> None:
         self.fuse = fuse
+        self.schedule = schedule
         self._compiled: dict[int, tuple[Graph, CompiledGraph]] = {}
 
     def compiled(self, graph: Graph) -> CompiledGraph:
         entry = self._compiled.get(id(graph))
         if entry is None or entry[0] is not graph:
-            entry = (graph, CompiledGraph(graph, fuse=self.fuse))
+            entry = (graph, CompiledGraph(graph, fuse=self.fuse, schedule=self.schedule))
             self._compiled[id(graph)] = entry
         return entry[1]
 
