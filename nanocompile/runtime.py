@@ -17,9 +17,12 @@ costs phase 7 removes by owning the cache.
 from __future__ import annotations
 
 import ctypes
+import os
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -34,9 +37,46 @@ from nanocompile.symbolic import Dim, evaluate_shape
 
 ALIGN = 64
 
+# Threads for parallel loops, the caller included, unless NANOCOMPILE_THREADS
+# says otherwise.
+DEFAULT_THREADS = 8
+
 
 class KernelError(RuntimeError):
     """A kernel rejected its input (an out-of-range gather index)."""
+
+
+# -- the thread pool -------------------------------------------------------------
+#
+# One pool per process, in its own small library, shared by every compiled
+# graph: two libraries with pools of their own would have two sets of workers
+# spinning against each other.
+
+_POOL: ctypes.CDLL | None = None
+
+
+def _pool() -> ctypes.CDLL:
+    global _POOL
+    if _POOL is None:
+        source = Path(__file__).with_name("pool.c").read_text(encoding="utf-8")
+        flags = () if sys.platform == "win32" else ("-pthread",)
+        path, _ = codegen_c.build_library(source, flags)
+        library = ctypes.CDLL(str(path))
+        library.nc_pool_set_threads.argtypes = [ctypes.c_int]
+        library.nc_pool_threads.restype = ctypes.c_int
+        configured = os.environ.get("NANOCOMPILE_THREADS")
+        library.nc_pool_set_threads(int(configured) if configured else DEFAULT_THREADS)
+        _POOL = library
+    return _POOL
+
+
+def set_threads(n: int) -> None:
+    """Threads that run parallel loops, the calling thread included."""
+    _pool().nc_pool_set_threads(n)
+
+
+def threads() -> int:
+    return _pool().nc_pool_threads()
 
 
 @dataclass(frozen=True)
@@ -133,6 +173,9 @@ class CompiledGraph:
         self.compile_seconds = time.perf_counter() - started
 
         self._library = ctypes.CDLL(str(self.library_path))
+        bind = self._library.nc_bind_pool
+        bind.argtypes = [ctypes.c_void_p]
+        bind(ctypes.cast(_pool().nc_pool_run, ctypes.c_void_p))
         self._kernels = [
             _KERNEL_TYPE((codegen_c.kernel_name(i), self._library))
             for i in range(len(self.program.kernels))

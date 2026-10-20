@@ -11,7 +11,7 @@ import ctypes
 
 import numpy as np
 
-from nanocompile import codegen_c
+from nanocompile import codegen_c, runtime
 from nanocompile import loopir as L
 
 _KERNEL = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int64))
@@ -22,6 +22,8 @@ def run_kernel(kernel: L.Kernel, out: np.ndarray, operands: list[np.ndarray], sy
     source = codegen_c.render_library([kernel])
     path, _ = codegen_c.build_library(source)
     library = ctypes.CDLL(str(path))
+    library.nc_bind_pool.argtypes = [ctypes.c_void_p]
+    library.nc_bind_pool(ctypes.cast(runtime._pool().nc_pool_run, ctypes.c_void_p))
     function = _KERNEL((codegen_c.kernel_name(0), library))
     arrays = [out] + [np.ascontiguousarray(a) for a in operands]
     pointers = (ctypes.c_void_p * len(arrays))(*[a.ctypes.data for a in arrays])

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from nanocompile import loopir as L
-from nanocompile import nn
+from nanocompile import nn, runtime
 from nanocompile.dtypes import f32, i64
 from nanocompile.frontend import GraphBuilder, gather
 from nanocompile.fusion import fuse
@@ -292,6 +292,61 @@ def test_vectorize_needs_exactly_eight_innermost_iterations():
         Schedule(matmul_kernel()).vectorize("i1")
     with pytest.raises(ScheduleError, match="innermost"):
         Schedule(matmul_kernel()).split("i1", 8).vectorize("i1i")
+
+
+# -- threads ---------------------------------------------------------------------
+
+
+@pytest.fixture(params=[1, 2, 3, 8])
+def thread_count(request):
+    before = runtime.threads()
+    runtime.set_threads(request.param)
+    yield request.param
+    runtime.set_threads(before)
+
+
+def parallel_outermost(kernel, calls):
+    return Schedule(kernel).parallel(Schedule(kernel).loops[0]).done()
+
+
+@pytest.mark.parametrize("name", ["elementwise", "rms_norm", "softmax", "matmul+epilogue", "swiglu"])
+def test_parallel_outermost_loop(name, thread_count):
+    compiled = check(name, parallel_outermost)
+    assert "nc_parallel(" in compiled.source
+
+
+def test_the_whole_matmul_recipe_on_threads(thread_count):
+    def schedule(kernel, calls):
+        s = Schedule(kernel)
+        s.split("i1", 16).reorder("i0", "i1o")
+        s.split("i1i", 8, outer="jv", inner="ji")
+        s.privatize("ji").privatize("jv")
+        s.split("i0", 2).privatize("i0i")
+        s.unroll("i0i").unroll("jv").vectorize("ji").parallel("i1o")
+        return s.done()
+    check("wide matmul", schedule)
+
+
+def test_the_pool_survives_many_small_tasks_back_to_back():
+    before = runtime.threads()
+    runtime.set_threads(4)
+    try:
+        compiled = CompiledGraph(CASES["softmax"].graph, schedule=parallel_outermost)
+        rng = np.random.default_rng(0)
+        for _ in range(2000):
+            x = rand(rng, 3, int(rng.integers(1, 4)), 11)
+            out = compiled({"x": x}, {})["y"]
+            np.testing.assert_allclose(out.sum(axis=-1), 1.0, rtol=1e-5)
+    finally:
+        runtime.set_threads(before)
+
+
+def test_parallel_needs_a_top_level_loop_without_bounds_checks():
+    with pytest.raises(ScheduleError, match="outermost"):
+        Schedule(matmul_kernel()).parallel("i1")
+    (gather_kernel,) = fuse(optimize(CASES["gather"].graph)).kernels
+    with pytest.raises(ScheduleError, match="stop early"):
+        Schedule(gather_kernel).parallel("i0")
 
 
 # -- legality --------------------------------------------------------------------

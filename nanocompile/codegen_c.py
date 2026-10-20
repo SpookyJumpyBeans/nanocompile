@@ -66,6 +66,18 @@ PRELUDE = """\
 #else
 #define NC_EXPORT __attribute__((visibility("default")))
 #endif
+
+/* Parallel loops run on nanocompile's thread pool (pool.c), which the
+   runtime binds after loading. Unbound, they run in order on one thread. */
+typedef void (*nc_task)(void *, int64_t);
+typedef void (*nc_runner)(nc_task, void *, int64_t);
+typedef struct { void **p; const int64_t *s; } nc_ctx;
+static nc_runner nc_run = 0;
+NC_EXPORT void nc_bind_pool(nc_runner run) { nc_run = run; }
+static inline void nc_parallel(nc_task fn, void *ctx, int64_t n) {
+    if (nc_run) { nc_run(fn, ctx, n); return; }
+    for (int64_t i = 0; i < n; ++i) fn(ctx, i);
+}
 """ + codegen_avx2.PRELUDE
 
 
@@ -126,8 +138,48 @@ def render_scalar(x: L.Scalar, parent: int = -1, right: bool = False) -> str:
     raise TypeError(f"cannot render {x!r}")
 
 
-def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] | None = None) -> list[str]:
-    """C for ``stmts``. ``vector`` is ``None`` for scalar C, else the arrays kept in registers."""
+class _Outliner:
+    """Collects the functions a kernel's parallel loops are outlined into.
+
+    A parallel loop's body becomes ``static void f(void *ctx, int64_t i)``,
+    called by the pool once per iteration with the kernel's parameter and
+    symbol arrays in ``ctx``. Schedules only mark a kernel's top-level loops
+    parallel, so a body needs nothing else from the kernel around it.
+    """
+
+    def __init__(self, kernel: L.Kernel, name: str) -> None:
+        self.kernel = kernel
+        self.name = name
+        self.functions: list[str] = []
+
+    def add(self, loop: L.Loop, vector: dict[str, int] | None) -> str:
+        fn = f"{self.name}_p{len(self.functions)}"
+        lines = [f"static void {fn}(void *nc_c, int64_t {loop.var}) {{",
+                 "    void **p = ((nc_ctx *)nc_c)->p;",
+                 "    const int64_t *s = ((nc_ctx *)nc_c)->s;"]
+        lines += _param_lines(self.kernel.params)
+        lines += _render_stmts(loop.body, 1, vector)
+        lines += ["    (void)p;", "    (void)s;", "}"]
+        self.functions.append("\n".join(lines))
+        return fn
+
+
+def _param_lines(params) -> list[str]:
+    lines = []
+    for i, param in enumerate(params):
+        ctype = C_TYPES[param.dtype]
+        qualifier = "" if param.writable else "const "
+        lines.append(f"    {qualifier}{ctype} *restrict x{i} = ({qualifier}{ctype} *)p[{i}];")
+    return lines
+
+
+def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] | None = None,
+                  outline: _Outliner | None = None) -> list[str]:
+    """C for ``stmts``.
+
+    ``vector`` is ``None`` for scalar C, else the arrays kept in registers;
+    ``outline`` collects parallel loops' bodies as functions.
+    """
     pad = "    " * depth
     lines: list[str] = []
     for position, stmt in enumerate(stmts):
@@ -144,6 +196,10 @@ def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] 
                 continue
         if isinstance(stmt, L.Loop) and stmt.kind == "vector" and vector is not None:
             lines.extend(codegen_avx2.VectorLoop(stmt, vector, render_scalar, C_TYPES).render(depth))
+        elif isinstance(stmt, L.Loop) and stmt.kind == "parallel" and outline is not None:
+            fn = outline.add(stmt, vector)
+            lines += [f"{pad}{{", f"{pad}    nc_ctx nc_c = {{p, s}};",
+                      f"{pad}    nc_parallel({fn}, &nc_c, {render_scalar(stmt.extent)});", f"{pad}}}"]
         elif isinstance(stmt, L.Loop):
             lines.append(
                 f"{pad}for (int64_t {stmt.var} = 0; {stmt.var} < {render_scalar(stmt.extent)}; ++{stmt.var}) {{"
@@ -176,23 +232,24 @@ def _render_stmts(stmts: tuple[L.Stmt, ...], depth: int, vector: dict[str, int] 
 
 
 def render_kernel(kernel: L.Kernel, name: str) -> str:
-    lines = [f"/* {kernel.primitive} */", f"NC_EXPORT int32_t {name}(void **p, const int64_t *s) {{"]
-    for i, param in enumerate(kernel.params):
-        ctype = C_TYPES[param.dtype]
-        qualifier = "" if param.writable else "const "
-        lines.append(f"    {qualifier}{ctype} *restrict x{i} = ({qualifier}{ctype} *)p[{i}];")
+    def body(vector):
+        outline = _Outliner(kernel, name)
+        main = _render_stmts(kernel.body, 1, vector, outline)
+        return outline.functions, main
+
+    lines = [f"/* {kernel.primitive} */"]
+    signature = f"NC_EXPORT int32_t {name}(void **p, const int64_t *s) {{"
     if has_vector_loops(kernel.body):
         # The scalar body is the same computation, for a compiler without AVX2.
-        lines.append("#if defined(__AVX2__)")
-        lines.extend(_render_stmts(kernel.body, 1, {}))
-        lines.append("#else")
-        lines.extend(_render_stmts(kernel.body, 1))
-        lines.append("#endif")
+        (vector_fns, vector_body), (scalar_fns, scalar_body) = body({}), body(None)
+        if vector_fns:
+            lines += ["#if defined(__AVX2__)", *vector_fns, "#else", *scalar_fns, "#endif"]
+        lines += [signature, *_param_lines(kernel.params),
+                  "#if defined(__AVX2__)", *vector_body, "#else", *scalar_body, "#endif"]
     else:
-        lines.extend(_render_stmts(kernel.body, 1))
-    lines.append("    (void)s;")
-    lines.append("    return 0;")
-    lines.append("}")
+        functions, main = body(None)
+        lines += [*functions, signature, *_param_lines(kernel.params), *main]
+    lines += ["    (void)p;", "    (void)s;", "    return 0;", "}"]
     return "\n".join(lines)
 
 
@@ -248,13 +305,13 @@ def _library_suffix() -> str:
     return {"win32": ".dll", "darwin": ".dylib"}.get(sys.platform, ".so")
 
 
-def library_key(source: str) -> str:
+def library_key(source: str, extra_flags: tuple[str, ...] = ()) -> str:
     cc = compiler()
-    material = "\n".join([source, " ".join(CFLAGS), _compiler_identity(cc)])
+    material = "\n".join([source, " ".join(CFLAGS + extra_flags), _compiler_identity(cc)])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
-def build_library(source: str) -> tuple[Path, bool]:
+def build_library(source: str, extra_flags: tuple[str, ...] = ()) -> tuple[Path, bool]:
     """Compile ``source`` to a shared library, or find it in the cache.
 
     Returns the library path and whether it was already cached. The library is
@@ -262,7 +319,7 @@ def build_library(source: str) -> tuple[Path, bool]:
     compile never leaves a truncated library where the cache will find it.
     """
     cc = compiler()
-    path = cache_dir() / f"nc_{library_key(source)}{_library_suffix()}"
+    path = cache_dir() / f"nc_{library_key(source, extra_flags)}{_library_suffix()}"
     if path.exists():
         return path, True
 
@@ -273,7 +330,7 @@ def build_library(source: str) -> tuple[Path, bool]:
         # -static-libgcc on Windows so the DLL depends on nothing outside the
         # OS; -fPIC elsewhere because a shared object requires it.
         platform_flags = ["-static-libgcc"] if sys.platform == "win32" else ["-fPIC"]
-        command = [cc, *CFLAGS, *platform_flags, "-shared", "-o", str(out), str(src)]
+        command = [cc, *CFLAGS, *extra_flags, *platform_flags, "-shared", "-o", str(out), str(src)]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             raise CompileError(f"gcc failed:\n{result.stderr[-4000:]}")

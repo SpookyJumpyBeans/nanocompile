@@ -335,6 +335,30 @@ class Schedule:
 
         return self._apply(f"vectorize {var}", var, fn)
 
+    def parallel(self, var: str) -> "Schedule":
+        """Share ``var``'s iterations among the threads of the pool.
+
+        The loop must be at the top of the kernel (its body is outlined into a
+        function the pool calls per iteration), its iterations independent,
+        and its body free of bounds checks, whose early return would leave
+        other threads' iterations running.
+        """
+        top = [s for s in self.kernel.body if isinstance(s, L.Loop) and s.var == var]
+        if var in self.loops and not top:
+            raise ScheduleError(f"parallel {var}: only a kernel's outermost loops can be parallel")
+
+        def fn(loop: L.Loop) -> list[L.Stmt]:
+            where = f"parallel {var}"
+            if loop.kind != "serial":
+                raise ScheduleError(f"{where}: the loop is already {loop.kind}")
+            if any(isinstance(s, L.Fail) for s in _all_stmts(loop.body)):
+                raise ScheduleError(f"{where}: the body checks its input and may stop early")
+            if not independent(loop):
+                raise ScheduleError(f"{where}: an iteration carries a value into the next")
+            return [replace(loop, kind="parallel")]
+
+        return self._apply(f"parallel {var}", var, fn)
+
     # -- result ----------------------------------------------------------------
 
     def done(self) -> L.Kernel:
