@@ -183,6 +183,35 @@ class CompiledGraph:
         self._last_use = self.program.last_uses()
         self._arena = np.empty(0, dtype=np.uint8)
         self.last_plan: Plan | None = None
+        # Operands a kernel reads packed: (call, operand) -> rows per block.
+        self._packed_operands = {
+            (c, i): param.packed
+            for c, call in enumerate(self.program.calls)
+            for i, param in enumerate(self.program.kernels[call.kernel].params[1:])
+            if param.packed is not None
+        }
+        self._packs: dict[tuple[Buffer, int], tuple[np.ndarray, np.ndarray]] = {}
+        for (c, i) in self._packed_operands:
+            view = self.program.calls[c].operands[i]
+            if view.buffer.kind != "weight" or len(view.buffer.shape) != 2 or view.offset != 0:
+                raise ValueError(f"call {c} reads {view.buffer!r} packed; only whole 2-D weights can be")
+
+    def _packed(self, buf: Buffer, block: int, weights: Mapping[str, np.ndarray]) -> np.ndarray:
+        """``buf`` in the packed layout, made once per weight array and kept.
+
+        Weights are constants: the same array handed in again is the same
+        packed copy. A different array (new weights) is packed afresh.
+        """
+        if buf.kind != "weight":
+            raise TypeError(f"only weights are packed, not {buf!r}")
+        source = weights[buf.name]
+        entry = self._packs.get((buf, block))
+        if entry is None or entry[0] is not source:
+            rows, cols = source.shape
+            packed = np.ascontiguousarray(np.asarray(source).reshape(rows // block, block, cols).transpose(0, 2, 1))
+            entry = (source, packed)
+            self._packs[(buf, block)] = entry
+        return entry[1]
 
     def _arena_base(self, size: int) -> int:
         if self._arena.nbytes < size + ALIGN:
@@ -226,9 +255,13 @@ class CompiledGraph:
         for buf, offset in plan.offsets.items():
             addresses[buf] = arena + offset
 
-        for call in program.calls:
+        for c, call in enumerate(program.calls):
             pointers = [addresses[call.output]]
-            for view in call.operands:
+            for i, view in enumerate(call.operands):
+                block = self._packed_operands.get((c, i))
+                if block is not None:
+                    pointers.append(self._packed(view.buffer, block, weights).ctypes.data)
+                    continue
                 itemsize = view.dtype.numpy.itemsize
                 pointers.append(addresses[view.buffer] + _offset_bytes(view.offset, itemsize, bound))
             args = (ctypes.c_void_p * len(pointers))(*pointers)

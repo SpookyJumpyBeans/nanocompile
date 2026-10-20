@@ -359,6 +359,41 @@ class Schedule:
 
         return self._apply(f"parallel {var}", var, fn)
 
+    def pack(self, param: int, rows: int, cols: int, block: int = codegen_avx2.LANES) -> "Schedule":
+        """Read operand ``param``, a row-major ``[rows, cols]`` array, in packed blocks.
+
+        Block ``b`` holds rows ``b * block`` to ``b * block + block - 1``,
+        stored column by column, so the ``block`` rows' elements in one column
+        are adjacent. A matmul that vectorizes over output columns reads eight
+        rows of a weight per vector, and packed, those eight values are one
+        contiguous load. Every read of the operand is rewritten to the packed
+        position; the runtime hands the kernel the operand in that layout,
+        made once.
+        """
+        where = f"pack x{param}"
+        if not 0 < param < len(self.kernel.params) or self.kernel.params[param].writable:
+            raise ScheduleError(f"{where}: not an operand of this kernel")
+        if self.kernel.params[param].packed is not None:
+            raise ScheduleError(f"{where}: already packed")
+        if rows % block:
+            raise ScheduleError(f"{where}: {rows} rows are not a whole number of blocks of {block}")
+
+        def packed_index(flat: L.Scalar) -> L.Scalar:
+            row, col = L.idiv(flat, L.const(cols)), L.mod(flat, L.const(cols))
+            return L.add(L.add(L.mul(L.idiv(row, L.const(block)), L.const(cols * block)),
+                               L.mul(col, L.const(block))), L.mod(row, L.const(block)))
+
+        def rewrite(x: L.Scalar) -> L.Scalar:
+            if isinstance(x, L.Load) and x.param == param:
+                return L.Load(param, packed_index(x.index), x.dtype)
+            return x
+
+        params = list(self.kernel.params)
+        params[param] = replace(params[param], packed=block)
+        self.kernel = replace(self.kernel, params=tuple(params), body=L.map_stmts(self.kernel.body, rewrite))
+        self.steps.append(where)
+        return self
+
     # -- result ----------------------------------------------------------------
 
     def done(self) -> L.Kernel:

@@ -349,6 +349,56 @@ def test_parallel_needs_a_top_level_loop_without_bounds_checks():
         Schedule(gather_kernel).parallel("i0")
 
 
+# -- packing ---------------------------------------------------------------------
+
+
+def weight_param(calls, name):
+    """The kernel parameter that every call fills with weight ``name``."""
+    (index,) = {i + 1 for call in calls for i, v in enumerate(call.operands) if v.buffer.name == name}
+    return index
+
+
+def packed_tile(rows):
+    def schedule(kernel, calls):
+        s = Schedule(kernel)
+        s.split("i1", 32).reorder("i0", "i1o")
+        s.split("i1i", 8, outer="jv", inner="ji")
+        s.privatize("ji").privatize("jv")
+        s.split("i0", rows).privatize("i0i")
+        s.pack(weight_param(calls, "w"), rows=32, cols=12)
+        s.unroll("i0i").unroll("jv").vectorize("ji").parallel("i1o")
+        return s.done()
+    return schedule
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+def test_a_packed_weight_is_read_with_contiguous_loads(rows):
+    compiled = check("wide matmul", packed_tile(rows))
+    source = compiled.source[compiled.source.index("#if defined(__AVX2__)\nstatic void"):]
+    w = weight_param(compiled.program.calls[0:1], "w")
+    assert f"_mm256_loadu_ps(&x{w}[" in source
+    assert "_mm256_setr_ps(" not in source.split("#else")[0]     # no lane-by-lane gathers left
+
+
+def test_each_weight_is_packed_once():
+    compiled = CompiledGraph(CASES["wide matmul"].graph, schedule=packed_tile(2))
+    rng = np.random.default_rng(1)
+    inputs, weights = CASES["wide matmul"].make(rng, 3)
+    compiled(inputs, weights)
+    (first,) = [packed for _, packed in compiled._packs.values()]
+    compiled(inputs, weights)
+    (again,) = [packed for _, packed in compiled._packs.values()]
+    assert again is first
+    compiled(inputs, {**weights, "w": weights["w"].copy()})       # new weights: packed afresh
+    (fresh,) = [packed for _, packed in compiled._packs.values()]
+    assert fresh is not first
+
+
+def test_pack_needs_whole_blocks_of_rows():
+    with pytest.raises(ScheduleError, match="whole number of blocks"):
+        Schedule(matmul_kernel()).pack(2, rows=10, cols=12)
+
+
 # -- legality --------------------------------------------------------------------
 
 
