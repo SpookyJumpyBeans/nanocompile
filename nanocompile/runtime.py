@@ -154,6 +154,16 @@ def _offset_bytes(offset: Dim, itemsize: int, bound: Mapping[str, int]) -> int:
 _KERNEL_TYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int64))
 
 
+def pack_weight(source: np.ndarray, block: int) -> np.ndarray:
+    """A ``[rows, cols]`` weight in the layout a packed parameter reads.
+
+    Blocks of ``block`` rows, column-major within a block: element ``(r, c)``
+    at ``(r / block) * cols * block + c * block + r % block`` (``L.Param``).
+    """
+    rows, cols = source.shape
+    return np.ascontiguousarray(np.asarray(source).reshape(rows // block, block, cols).transpose(0, 2, 1))
+
+
 class CompiledGraph:
     """A graph lowered, compiled and loaded: call it like ``interpreter.run``.
 
@@ -163,9 +173,10 @@ class CompiledGraph:
 
     ``schedule`` is how fused kernels are scheduled (phase 4): ``"default"``
     for the hand-written recipes in ``schedules.py``, ``None`` for phase 3's
-    kernels as fusion wrote them, or a function called as
-    ``schedule(kernel, calls)`` for each distinct kernel. Unfused programs are
-    never scheduled; they are the baseline.
+    kernels as fusion wrote them, a function called as
+    ``schedule(kernel, calls)`` for each distinct kernel, or an
+    ``autotune.Autotuner`` (phase 5), which searches each kernel's space.
+    Unfused programs are never scheduled; they are the baseline.
     """
 
     def __init__(self, graph: Graph, fuse: bool = True, schedule="default") -> None:
@@ -176,7 +187,12 @@ class CompiledGraph:
         if schedule == "default":
             schedule = schedules.default
         if fuse and schedule is not None:
-            self.program = schedule_program(self.program, schedule)
+            if hasattr(schedule, "schedule_program"):
+                # An autotuner (phase 5): it needs the whole program, for the
+                # symbols a kernel's shapes are written in.
+                self.program = schedule.schedule_program(self.program)
+            else:
+                self.program = schedule_program(self.program, schedule)
         self.source = codegen_c.render_library(self.program.kernels)
         self.library_path, self.cached = codegen_c.build_library(self.source)
         self.compile_seconds = time.perf_counter() - started
@@ -216,9 +232,7 @@ class CompiledGraph:
         source = weights[buf.name]
         entry = self._packs.get((buf, block))
         if entry is None or entry[0] is not source:
-            rows, cols = source.shape
-            packed = np.ascontiguousarray(np.asarray(source).reshape(rows // block, block, cols).transpose(0, 2, 1))
-            entry = (source, packed)
+            entry = (source, pack_weight(source, block))
             self._packs[(buf, block)] = entry
         return entry[1]
 
