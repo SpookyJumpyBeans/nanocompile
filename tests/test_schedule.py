@@ -87,12 +87,17 @@ def rand(rng, *shape):
 CASES = _cases()
 
 
-def check(name: str, schedule) -> CompiledGraph:
-    """Run ``name`` plainly and scheduled at every size; require identical bits."""
+def check(name: str, schedule, changes: bool = True) -> CompiledGraph:
+    """Run ``name`` plainly and scheduled at every size; require identical bits.
+
+    ``changes=False`` for a tuner, which may measure that the kernel as
+    fusion wrote it is already the fastest and keep it.
+    """
     case = CASES[name]
     plain = CompiledGraph(case.graph, schedule=None)
     scheduled = CompiledGraph(case.graph, schedule=schedule)
-    assert scheduled.source != plain.source, "the schedule changed nothing"
+    if changes:
+        assert scheduled.source != plain.source, "the schedule changed nothing"
     rng = np.random.default_rng(len(name))
     for seq in SIZES:
         inputs, weights = case.make(rng, seq)
