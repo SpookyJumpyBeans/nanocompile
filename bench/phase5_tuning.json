@@ -1,0 +1,256 @@
+{
+ "machines": {
+  "9883c381aabf9b9c": {
+   "088ff426f00b29123d6c": {
+    "default_cost": 5.4012375361956865e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:00:27",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 5.4012375361956865e-06
+   },
+   "08b8814ae4c0f1674a4b": {
+    "default_cost": 0.0008143238275692966,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:02:08",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 3,
+     "unroll": true,
+     "vectors": 2
+    },
+    "winner_cost": 0.0007719499991480916
+   },
+   "0ab000b49e57a5164845": {
+    "default_cost": 8.105726161981389e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:09:24",
+    "winner": {
+     "parallel": false,
+     "vectorize": true
+    },
+    "winner_cost": 2.70312436138435e-06
+   },
+   "1bb5e67a020e7564b3a1": {
+    "default_cost": 0.04064891875100329,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:28:54",
+    "winner": {
+     "pack": true,
+     "parallel": false,
+     "recipe": "columns",
+     "rows": 1,
+     "unroll": true,
+     "vectors": 8
+    },
+    "winner_cost": 0.03747619218370346
+   },
+   "1febb1ad4075c2bff45a": {
+    "default_cost": 6.5190429694439445e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:02:55",
+    "winner": {
+     "parallel": true,
+     "vectorize": true
+    },
+    "winner_cost": 6.5190429694439445e-06
+   },
+   "20b9a2d01b3e416a7da5": {
+    "default_cost": 6.532417003768387e-05,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:00:08",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": false,
+     "vectors": 1
+    },
+    "winner_cost": 5.667968765266096e-05
+   },
+   "2277416a23ff3f7dcb7c": {
+    "default_cost": 6.036224278314002e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:16",
+    "winner": {
+     "parallel": false,
+     "vectorize": false
+    },
+    "winner_cost": 1.018013707476849e-06
+   },
+   "2cbbcfd86c6169a958a2": {
+    "default_cost": 9.74749839438544e-07,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:14",
+    "winner": {
+     "parallel": true,
+     "vectorize": false
+    },
+    "winner_cost": 9.74749839438544e-07
+   },
+   "3fa55e91bb2542d44e43": {
+    "default_cost": 6.764016319493749e-05,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:39",
+    "winner": {
+     "parallel": true,
+     "recipe": "scalar"
+    },
+    "winner_cost": 6.764016319493749e-05
+   },
+   "5a2bf2d88ab548b131ef": {
+    "default_cost": 0.00023639397340957657,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:09",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 0.00023639397340957657
+   },
+   "a110861e9ee73597c821": {
+    "default_cost": 6.461473380373458e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:09:29",
+    "winner": {
+     "parallel": false,
+     "vectorize": true
+    },
+    "winner_cost": 2.0428124246661485e-06
+   },
+   "a1814e681356d25aa8b5": {
+    "default_cost": 3.6389806102076885e-07,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:58:28",
+    "winner": {
+     "vectorize": true
+    },
+    "winner_cost": 3.6389806102076885e-07
+   },
+   "a6f9e4578a35066e20e5": {
+    "default_cost": 9.193298202052784e-07,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:12",
+    "winner": {
+     "parallel": true,
+     "vectorize": false
+    },
+    "winner_cost": 9.193298202052784e-07
+   },
+   "a78b40f90bd31cbec027": {
+    "default_cost": 0.0017300359372711682,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:01:33",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 0.0017300359372711682
+   },
+   "bf046466c78cdc0af6a6": {
+    "default_cost": 0.001148787889974301,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:02:43",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 0.001148787889974301
+   },
+   "c3fca695220093c6af26": {
+    "default_cost": 0.00016823020839529777,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:01:16",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 0.00016823020839529777
+   },
+   "d4fb3c37b7723a0f74e6": {
+    "default_cost": 2.282576796252423e-05,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:42",
+    "winner": {
+     "parallel": true,
+     "vectorize": false
+    },
+    "winner_cost": 2.282576796252423e-05
+   },
+   "e14e14c5f7e442315a1c": {
+    "default_cost": 2.7266796813307792e-05,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:34",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 2,
+     "unroll": true,
+     "vectors": 1
+    },
+    "winner_cost": 1.9030810605613624e-05
+   },
+   "f13e29e7764a9d88ea74": {
+    "default_cost": 2.3828952818842726e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:59:36",
+    "winner": {
+     "parallel": false,
+     "vectorize": false
+    },
+    "winner_cost": 1.5079071633732173e-07
+   },
+   "f606d981733663603239": {
+    "default_cost": 2.256799316313618e-06,
+    "seed": 0,
+    "tuned_at": "2026-10-25T21:58:33",
+    "winner": {
+     "parallel": true,
+     "vectorize": true
+    },
+    "winner_cost": 2.256799316313618e-06
+   },
+   "fbada952bcdd6450cee5": {
+    "default_cost": 0.04732185000852951,
+    "seed": 0,
+    "tuned_at": "2026-10-25T22:09:17",
+    "winner": {
+     "pack": true,
+     "parallel": true,
+     "recipe": "columns",
+     "rows": 3,
+     "unroll": true,
+     "vectors": 4
+    },
+    "winner_cost": 0.04568125624723507
+   }
+  }
+ },
+ "version": 1
+}
