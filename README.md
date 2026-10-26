@@ -29,7 +29,7 @@ tools use it, and `nanocompile/` never imports it.
 | 2 | Loop IR, one kernel per primitive, C codegen through gcc; tokens identical to nanoinfer | **done**: tokens identical, 0.97 tok/s naive baseline (6.0x slower) |
 | 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | **done**: bitwise identical to unfused, 62 to 13 kernels per block, 1.18x faster |
 | 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | **done**: bitwise identical to phase 3, 3.1x faster, matmul at the roofline (199 of 200.5 GFLOP/s) |
-| 5 | Autotuning over the schedule space, on a machine known to be noisy | not started |
+| 5 | Autotuning over the schedule space, on a machine known to be noisy | **done**: bitwise identical, 4% faster decode, winner unstable on 7 of 20 kernels and reported |
 | 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | not started |
 | 7 | Whole-model compilation: one library, one call per token, a static memory plan | not started |
 | 8 | Benchmark against nanoinfer and llama.cpp on identical hardware | not started |
@@ -81,6 +81,7 @@ python -m bench.phase1
 python -m bench.phase2
 python -m bench.phase3
 OPENBLAS_NUM_THREADS=6 python -m bench.phase4
+OPENBLAS_NUM_THREADS=6 python -m bench.phase5
 ```
 
 ### Phase 1: graph IR and reference interpreter
@@ -518,6 +519,119 @@ and anywhere from 0.2 to 2.4 s on twenty, before nanocompile's pool existed
 in the process. A first run of this benchmark under that default showed
 NumPy almost 400x slower on `down` and a 72-second prefill for nanoinfer; it was
 discarded rather than published as a win.
+
+### Phase 5: autotuning
+
+Phase 4's recipes are now functions of a few knobs (`nanocompile/schedules.py`).
+A projection's are column vectors per tile, rows per tile, whether to pack the
+weight, whether to unroll, and whether to run on the pool; a row or
+elementwise kernel's are whether to vectorize and whether to go parallel.
+Phase 4's hand-written schedule is one point of each space, and the refactor
+reproduces it exactly: the default-scheduled C of the real model is the same
+text, byte for byte, as before.
+
+`nanocompile/autotune.py` searches each kernel's space on this machine:
+
+- **The space** is every configuration that applies, counted once per distinct
+  generated kernel: 130 for a projection, 2 to 26 for everything else.
+- **Cost is measured.** Candidates are compiled into one library and timed by
+  a C loop, in alternation: every round times each candidate once, starting
+  one later each round, and the cost is the median over rounds. Weights rotate
+  through enough copies to stream from memory, as a decode step's do. The
+  workload is a decode step plus a 32-token prefill per token, so a knob only
+  prefill uses (rows per tile) is chosen by measurement.
+- **The search is seeded**: a random sample of 8 with the hand-written
+  schedule, then greedy refinement, one knob one step at a time. A final run
+  times the winner against the hand-written schedule, and it is kept only if
+  it is more than 3% faster in that run.
+- **The cache** (`tuning.json`) is keyed by machine (compiler, CPU, threads)
+  and by kernel (its C, its operands, the workloads); a hit applies the
+  recorded winner without measuring.
+
+Correctness:
+
+| Check | Result |
+|---|---|
+| Every configuration of every kernel in phase 4's cases, at sizes leaving every tail length | **bitwise identical** to the unscheduled kernel, and no write outside the output |
+| Tuned programs through phase 4's own `check` | **bitwise identical** |
+| Tuned tiny model, and tuned real model from the recorded winners | **bitwise identical** to phase 3 |
+| Every candidate the tuner compiles, before it is timed | checked bitwise against the unscheduled kernel, with guard regions either side of the output |
+
+The guard regions came from a bug. The full suite crashed once in four runs
+with heap corruption, and the cause was a test that handed one kernel
+another's operands: it wrote 60 floats into a 39-float output, and the
+bitwise check passed, because the 39 it compared were right. A write past an
+output corrupts its neighbours without changing the output, so the tuner now
+checks for that separately, and a test proves it catches one.
+
+**Per kernel**, the real model, the winner against the hand-written schedule
+in the final comparison:
+
+| Kernel | Calls/step | Space | Tried | Tuned vs hand | Winners in 3 runs |
+|---|---:|---:|---:|---:|---:|
+| RoPE on k (bias add, rotate) | 24 | 2 | 2 | **15.8x** | **1**: serial |
+| RoPE on q | 24 | 2 | 2 | **5.9x** | **1**: serial |
+| KV cache concats | 1 + 1 | 4 | 4 | **3.0x, 3.2x** | **1**: serial |
+| `k_proj`, 128 x 896 | 24 | 130 | 20 | 1.43x | 3 |
+| `v_proj` + bias | 24 | 130 | 25 | 1.15x | 3 |
+| `down` + residual | 23 | 130 | 28 | 1.06x | 2 |
+| LM head | 1 | 130 | 22 | 1.04x | 2 |
+| `q_proj`, `o_proj`, `gate`/`up`, the last `down`, both attention matmuls | 1 to 24 | 2 to 130 | 2 to 32 | hand-written kept | 1 or 2 |
+| norms, softmax, embedding gather, RoPE tables | 1 to 48 | 2 to 4 | 2 to 4 | hand-written kept | 1 or 2 |
+
+Everything the search found is small work. A decode step's RoPE kernels
+touch 128 and 896 floats, and waking six threads costs more than doing them
+on one; the hand-written recipe ran them on the pool because every kernel
+with more than one row did. The `k_proj` and `v_proj` gains are phase 4's own
+open question answered: a 128-wide output in 32-column blocks is 4 tasks for
+6 threads, and 8-column blocks are 16.
+
+**How often the winner changes**, three runs with the same seed (so the same
+sample, and any difference is the machine): on **7 of 20** kernels. Every
+kernel whose win was 3x or more chose the same winner every time. The ones
+that changed are all matmuls or a row kernel with differences of 0 to 6%,
+except `k_proj`, whose 1.43x appeared in one run of three: the other two kept
+the hand-written tile or changed only its rows. On a 20 us decode matmul,
+this machine's noise is the size of the differences between schedules, and
+a search can only report that, not resolve it. The refinement path, which
+follows measurements, differed on 9 of 20.
+
+**Reproducibility**, the gate: every run's 20 searches were replayed on
+their own recorded costs, 60 in all, and each tried exactly the candidates
+it had tried. The sample is the same in every run by construction.
+
+**Search time**: 674, 531 and 535 s for the whole model. The LM head is
+most of it, 382 s, because each of its samples streams 545 MB.
+
+**The model**, phase 4's schedules against the first run's winners, in a fresh
+process, the engine going first swapping every round, 6 rounds of 24 tokens:
+
+| | Median step | Min | Decode | Prefill |
+|---|---:|---:|---:|---:|
+| hand-written (phase 4) | 75.9 ms | 69.7 ms | 13.17 tok/s | 78.6 ms |
+| tuned | 72.8 ms | 65.0 ms | **13.74 tok/s** | 82.5 ms |
+
+**4% faster per decode step, tuned ahead in 6 of 6 rounds** (sign test,
+one-sided p = 0.016), tokens identical. Prefill is level within noise.
+Which kernels the 4% comes from is not separable here: the stable RoPE and
+concat wins, or the first run's matmul winners, which the other runs did not
+all repeat.
+
+**A first measurement was discarded.** Timed in the process that had just
+spent half an hour tuning, with the hand-written model always first, it
+showed the tuned model **1.46x** faster and a 2.2 s hand-written prefill
+against phase 4's 92 ms. The per-kernel gains could not add up to that, so
+the benchmark now times the model in a fresh process and swaps the order;
+the tuning statistics from that run stand, and its model timing is marked
+discarded in `bench/results.jsonl`.
+
+```
+python -m bench.phase5                 # tune 3 times, then time the model
+python -m bench.phase5 --model-only    # time the model from bench/phase5_tuning.json
+```
+
+In code, `CompiledGraph(graph, schedule=Autotuner())` tunes on first compile
+and reads the cache after that.
 
 ## Measuring
 
