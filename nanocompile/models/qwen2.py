@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from nanocompile import dtypes, interpreter
+from nanocompile import dtypes, interpreter, quantize
 from nanocompile.frontend import GraphBuilder, Tensor, concat, gather
 from nanocompile.ir import Graph
 from nanocompile.nn import (
@@ -271,11 +271,21 @@ class KVCache:
         self.length += n
 
 
+# Phase 6's modes: the activations each int8 kernel takes (quantize.py).
+QUANTIZATIONS = {"int8": "f32", "int8-vnni": "int8"}
+
+
 class Qwen2:
     """The compiled model's front door: token IDs in, logits out.
 
     ``run`` executes a graph. In phase 1 it is the interpreter; from phase 2
     on it is generated code, and nothing else here changes.
+
+    ``quantization`` is ``None`` for float32, ``"int8"`` for per-row int8
+    projection weights with float activations (nanoinfer's int8 engine), or
+    ``"int8-vnni"`` for int8 activations too, one scale per 32 values
+    (nanoinfer's VNNI path). The LM head stays float32 either way; see
+    ``quantize.py``. The int8 weights are made from ``weights`` once, here.
     """
 
     def __init__(
@@ -283,12 +293,22 @@ class Qwen2:
         config: Qwen2Config,
         weights: Mapping[str, np.ndarray],
         run: Runner = interpreter.run,
+        quantization: str | None = None,
     ) -> None:
         self.config = config
-        self.weights = weights
         self.run = run
+        self.quantization = quantization
         self.graph = build_qwen2(config)
         self.graph_last = build_qwen2(config, last_only=True)
+        if quantization is not None:
+            if quantization not in QUANTIZATIONS:
+                raise ValueError(f"quantization must be one of {sorted(QUANTIZATIONS)} or None")
+            mode = QUANTIZATIONS[quantization]
+            keep = ("lm_head.weight",)
+            self.graph = quantize.quantize(self.graph, mode, keep=keep)
+            self.graph_last = quantize.quantize(self.graph_last, mode, keep=keep)
+            weights = quantize.quantized_weights(self.graph, weights)
+        self.weights = weights
 
     def new_cache(self, capacity: int = 256) -> KVCache:
         return KVCache(self.config, capacity)

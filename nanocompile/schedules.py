@@ -40,6 +40,25 @@ the parallelism is across the independent sums of a tile. Its knobs:
 
 ``recipe="scalar"`` is the fallback, the kernel's outer loops in parallel.
 
+**int8 projections** (phase 6) come out of fusion already in nanoinfer's
+order: 32 accumulators, four chains of eight lanes (``lower.int8_dots``).
+The recipe only decides how that runs, so every point is still nanoinfer's
+bits:
+
+    for no in N / rows, in parallel:       # a block of weight rows per task
+        for each row in the block:
+            for each token:                # the row stays in L1 across tokens
+                acc[4][8] = 0              # four registers per dot
+                for k0 in K / 32: four FMAs (or VPDPBUSDs) of 8 lanes
+                combine, scale, epilogue
+
+* ``vectorize``: unroll the four chains and run each as eight lanes.
+* ``rows``: weight rows per task on the pool.
+* ``parallel``: run the row blocks on the pool.
+
+Weight rows go outside tokens whichever the knobs: a row read once per
+prompt rather than once per token is the point of batching prefill.
+
 **Attention matmuls** run one task per head. ``softmax @ V`` reads ``V``
 contiguously along its output columns and gets the same recipe without
 packing. ``q @ K^T`` reads ``K`` with a stride, so it stays scalar per head.
@@ -74,6 +93,7 @@ SPACES: dict[str, dict[str, tuple]] = {
         "unroll": (True, False),
         "parallel": (True, False),
     },
+    "int8": {"vectorize": (True, False), "rows": (4, 16, 64), "parallel": (True, False)},
     "row": {"vectorize": (True, False), "parallel": (True, False)},
     "gather": {"vectorize": (True, False)},
     "elementwise": {"vectorize": (True, False), "parallel": (True, False)},
@@ -86,6 +106,8 @@ DEFAULTS: dict[str, tuple[dict, ...]] = {
         {"recipe": "columns", "vectors": 4, "rows": 2, "pack": True, "unroll": True, "parallel": True},
         {"recipe": "scalar", "parallel": True},
     ),
+    # Phase 6 wrote these by hand too; the tuner searches around them.
+    "int8": ({"vectorize": True, "rows": 16, "parallel": True}, {"vectorize": False, "rows": 16, "parallel": True}),
     "row": ({"vectorize": True, "parallel": True}, {"vectorize": False, "parallel": True}),
     "gather": ({"vectorize": True},),
     "elementwise": (
@@ -97,6 +119,8 @@ DEFAULTS: dict[str, tuple[dict, ...]] = {
 
 
 def kernel_class(kernel: L.Kernel) -> str:
+    if kernel.primitive.startswith("matmul_i8"):
+        return "int8"
     if kernel.primitive.startswith("matmul"):
         return "matmul"
     if kernel.primitive in ("row", "gather"):
@@ -143,6 +167,8 @@ def space_of_class(cls: str) -> list[dict]:
         config = dict(zip(knobs, values))
         if config.get("recipe") == "scalar":
             config = {"recipe": "scalar", "parallel": config["parallel"]}
+        if cls == "int8" and not config["parallel"]:
+            config = {"vectorize": config["vectorize"], "parallel": False}
         key = canonical(config)
         if key not in seen:
             seen.add(key)
@@ -171,6 +197,8 @@ def apply(kernel: L.Kernel, calls, config: Config) -> L.Kernel:
         if config["recipe"] == "columns":
             return _matmul_columns(kernel, calls, config)
         return _outer_parallel(kernel, calls, config)
+    if cls == "int8":
+        return _int8(kernel, calls, config)
     if cls == "row":
         return _row(kernel, calls, config)
     if cls == "gather":
@@ -267,6 +295,41 @@ def _matmul_columns(kernel: L.Kernel, calls, config: Config) -> L.Kernel:
     if config["parallel"]:
         s.parallel("jo" if projection else outputs[0])
     return s.done()
+
+
+# -- int8 projections ----------------------------------------------------------
+
+
+def _int8(kernel: L.Kernel, calls, config: Config) -> L.Kernel:
+    """Weight rows outermost and on the pool; each dot's chains as vectors."""
+    outputs = [v for v in _outer_nest(kernel) if v.startswith("i")]
+    if not outputs:
+        raise ScheduleError("an int8 matmul with no output loop")
+    column = outputs[-1]
+    s = Schedule(kernel)
+    if len(outputs) == 2:
+        s.reorder(outputs[0], column)          # rows outside tokens
+    elif len(outputs) > 2:
+        raise ScheduleError("an int8 matmul with batch dimensions")
+    if config["vectorize"]:
+        loops = set(s.loops)
+        if "kc" in loops:
+            s.unroll("kc").vectorize("kl")
+        if "kg" in loops:
+            s.vectorize("kg")
+        s.vectorize("kh")
+    if config["parallel"]:
+        s.split(column, int(config["rows"]), outer="no", inner="ni", tail="nt").parallel("no")
+    return s.done()
+
+
+def _outer_nest(kernel: L.Kernel) -> list[str]:
+    """The loop variables from the top of the kernel down, while each loop is alone in its parent."""
+    names, stmts = [], kernel.body
+    while len(stmts) == 1 and isinstance(stmts[0], L.Loop):
+        names.append(stmts[0].var)
+        stmts = stmts[0].body
+    return names
 
 
 # -- everything else -------------------------------------------------------------

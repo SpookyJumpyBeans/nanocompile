@@ -44,6 +44,9 @@ UNARY = {
     "reciprocal": (lambda x: x.reciprocal(), np.reciprocal),
     "sin": (lambda x: x.sin(), np.sin),
     "cos": (lambda x: x.cos(), np.cos),
+    # Half away from zero, not NumPy's half to even.
+    "round": (lambda x: x.round(),
+              lambda a: np.copysign(np.floor(np.abs(a.astype(np.float64)) + 0.5), a).astype(a.dtype)),
 }
 
 
@@ -232,6 +235,7 @@ def test_every_primitive_is_covered():
         "input", "weight", "const", "iota", "dim", "where", "cast",
         "reduce_sum", "reduce_max", "reshape", "permute", "broadcast",
         "slice", "concat", "matmul", "gather",
+        "matmul_i8", "matmul_i8_vnni",      # in test_int8.py, against nanoinfer's kernels
     }
     assert set(OPS) == tested
     assert set(OPS) - {"input", "weight"} == set(interpreter.KERNELS)

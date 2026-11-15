@@ -186,6 +186,10 @@ class Operands:
     def _random(self, shape, dtype) -> np.ndarray:
         if np.issubdtype(dtype, np.floating):
             return self._fill.standard_normal(shape).astype(dtype)
+        if np.dtype(dtype) == np.int8:
+            # int8 weights and activations: all-zero bytes would make every
+            # candidate's output zero, and the bitwise check vacuous.
+            return self._fill.integers(-127, 128, size=shape).astype(dtype)
         return np.zeros(shape, dtype=dtype)      # indices: zero is always in range
 
     def weight(self, i: int, packed: int | None, copy: int) -> np.ndarray:
@@ -384,6 +388,13 @@ def neighbours(config: Mapping, kernel_class: str) -> list[dict]:
                     changed = {**schedules.DEFAULTS["matmul"][0], "parallel": config["parallel"]}
                 elif changed.get("recipe") == "scalar":
                     changed = {"recipe": "scalar", "parallel": changed["parallel"]}
+                elif kernel_class == "int8":
+                    # rows means nothing without the pool: dropped going serial,
+                    # the hand-written value coming back.
+                    if changed["parallel"]:
+                        changed.setdefault("rows", schedules.DEFAULTS["int8"][0]["rows"])
+                    else:
+                        changed.pop("rows", None)
                 out.append(changed)
     return out
 

@@ -11,8 +11,14 @@ loop produces:
   add into an FMA.
 * Comparisons use the predicates that match C on NaN: ``<`` and ``<=`` are
   false for a NaN operand, ``!=`` is true.
-* ``exp``, ``sin`` and ``cos`` call the same C library function once per
-  lane, since a vector approximation would round differently.
+* An ``Fma`` node is ``vfmadd``, which rounds once, as ``fmaf`` does.
+* ``exp``, ``sin``, ``cos`` and ``round`` call the same C library function
+  once per lane, since a vector approximation would round differently (and
+  AVX has no rounding mode that sends halves away from zero).
+* An int8 load widened to float is exact either way: eight bytes, sign
+  extended, converted. A ``Dp4`` is one VPDPBUSD lane, so eight of them whose
+  bytes are contiguous are one ``vpdpbusd`` on 32 bytes; the integer sum is
+  exact, so the instruction and the C loop agree on every bit.
 * A select with one condition for all lanes is a C ``?:`` on vectors, which
   evaluates only the chosen branch, as scalar C does; a ``concat`` depends on
   that, since the branch not taken may index outside its operand. A select
@@ -51,13 +57,24 @@ PRELUDE = """\
 NC_LANEWISE(expf)
 NC_LANEWISE(sinf)
 NC_LANEWISE(cosf)
+NC_LANEWISE(roundf)
+static inline __m256 nc_v_i8(const int8_t *p) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)p)));
+}
 static inline __m256 nc_v_mask(int c) { return _mm256_castsi256_ps(_mm256_set1_epi32(c ? -1 : 0)); }
+#endif
+#if defined(__AVX2__) && defined(__AVXVNNI__)
+static inline __m256 nc_v_dp4(const int8_t *a, const int8_t *b) {
+    __m256i w = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *)a), _mm256_set1_epi8((char)0x80));
+    __m256i x = _mm256_loadu_si256((const __m256i *)b);
+    return _mm256_cvtepi32_ps(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), w, x));
+}
 #endif
 """
 
 _ARITH = {"add": "_mm256_add_ps", "sub": "_mm256_sub_ps", "mul": "_mm256_mul_ps", "div": "_mm256_div_ps"}
 _CMP = {"lt": "_CMP_LT_OQ", "le": "_CMP_LE_OQ", "ne": "_CMP_NEQ_UQ"}
-_LANEWISE = {"exp": "nc_v_expf", "sin": "nc_v_sinf", "cos": "nc_v_cosf"}
+_LANEWISE = {"exp": "nc_v_expf", "sin": "nc_v_sinf", "cos": "nc_v_cosf", "round": "nc_v_roundf"}
 
 
 class VectorError(ValueError):
@@ -122,6 +139,7 @@ class VectorLoop:
         self.varying: set[str] = set()
         self.simplifier = Simplifier({loop.var: (0, LANES - 1)})
         self.temps = 0
+        self.vnni = False         # set when a lane is a VPDPBUSD lane
 
     # -- what differs between lanes ----------------------------------------------
 
@@ -195,6 +213,20 @@ class VectorLoop:
             return f"_mm256_blendv_ps({self.vec(x.b)}, {self.vec(x.a)}, {self.vec(x.cond)})"
         if isinstance(x, L.Cast) and x.dtype == dtypes.f32 and x.a.dtype == dtypes.f32:
             return self.vec(x.a)
+        if isinstance(x, L.Cast) and x.dtype == dtypes.f32 and isinstance(x.a, L.Load) and x.a.dtype == dtypes.i8:
+            base = f"x{x.a.param}"
+            if self._coefficient(x.a.index) == 1:
+                return f"nc_v_i8(&{base}[{self._at(x.a.index, 0)}])"
+            lanes = ", ".join(f"(float){base}[{self._at(x.a.index, l)}]" for l in range(LANES))
+            return f"_mm256_setr_ps({lanes})"
+        if isinstance(x, L.Cast) and x.dtype == dtypes.f32 and isinstance(x.a, L.Dp4):
+            a, b = x.a.a, x.a.b
+            if self._coefficient(a.index) != 4 or self._coefficient(b.index) != 4:
+                raise VectorError("a Dp4 vector reads 32 contiguous bytes from each operand")
+            self.vnni = True
+            return f"nc_v_dp4(&x{a.param}[{self._at(a.index, 0)}], &x{b.param}[{self._at(b.index, 0)}])"
+        if isinstance(x, L.Fma) and x.dtype == dtypes.f32:
+            return f"_mm256_fmadd_ps({self.vec(x.a)}, {self.vec(x.b)}, {self.vec(x.c)})"
         raise VectorError(f"no exact vector form for {type(x).__name__} {getattr(x, 'op', '')}".strip())
 
     def _load(self, base: str, index: L.Scalar, dtype) -> str:
@@ -260,3 +292,14 @@ class VectorLoop:
 def check(loop: L.Loop, scalar, ctypes) -> None:
     """Raise ``VectorError`` unless ``loop`` has an exact AVX2 rendering."""
     VectorLoop(loop, {}, scalar, ctypes).render(0)
+
+
+def uses_vnni(stmts) -> bool:
+    """Whether any vector loop in ``stmts`` renders a ``Dp4`` as ``vpdpbusd``."""
+    for s in stmts:
+        if isinstance(s, L.Loop) and s.kind == "vector":
+            if any(isinstance(x, L.Dp4) for x in L.scalars_of(s.body)):
+                return True
+        elif isinstance(s, (L.Loop, L.Block)) and uses_vnni(s.body):
+            return True
+    return False
