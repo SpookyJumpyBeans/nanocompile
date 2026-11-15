@@ -30,7 +30,7 @@ tools use it, and `nanocompile/` never imports it.
 | 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | **done**: bitwise identical to unfused, 62 to 13 kernels per block, 1.18x faster |
 | 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | **done**: bitwise identical to phase 3, 3.1x faster, matmul at the roofline (199 of 200.5 GFLOP/s) |
 | 5 | Autotuning over the schedule space, on a machine known to be noisy | **done**: bitwise identical, 4% faster decode, winner unstable on 7 of 20 kernels and reported |
-| 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | not started |
+| 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | **done**: bitwise identical to nanoinfer's Rust kernels, perplexity 23.3078, 1.4x faster decode than fp32, nanoinfer still 4 to 15% ahead |
 | 7 | Whole-model compilation: one library, one call per token, a static memory plan | not started |
 | 8 | Benchmark against nanoinfer and llama.cpp on identical hardware | not started |
 
@@ -44,7 +44,7 @@ here rather than being quietly redefined.
 Qwen2 in the frontend            a Python graph builder; rms_norm, softmax, RoPE
         │                        and attention are compositions of primitives
         ▼
-Graph IR                         SSA over 26 primitives, dtypes, symbolic dims
+Graph IR                         SSA over 30 primitives, dtypes, symbolic dims
         │                        (seq, past) so one graph serves every step
         │   passes: fusion (3), quantization (6)
         ▼
@@ -82,6 +82,8 @@ python -m bench.phase2
 python -m bench.phase3
 OPENBLAS_NUM_THREADS=6 python -m bench.phase4
 OPENBLAS_NUM_THREADS=6 python -m bench.phase5
+python -m bench.phase6 --part speed
+python -m bench.phase6 --part perplexity
 ```
 
 ### Phase 1: graph IR and reference interpreter
@@ -632,6 +634,133 @@ python -m bench.phase5 --model-only    # time the model from bench/phase5_tuning
 
 In code, `CompiledGraph(graph, schedule=Autotuner())` tunes on first compile
 and reads the cache after that.
+
+### Phase 6: INT8
+
+A graph pass (`nanocompile/quantize.py`) rewrites every `x @ W.T` whose `W`
+is a projection weight into an int8 matmul reading `W@int8` and `W@scales`:
+per-row symmetric int8, nanoinfer's format, made by the same NumPy operations
+nanoinfer uses, so the integers and scales are its own byte for byte. Two
+modes, matching nanoinfer's two kernels:
+
+- **`int8`**: `matmul_i8`, float32 activations, each weight widened in the
+  kernel. nanoinfer's default int8 engine.
+- **`int8-vnni`**: `matmul_i8_vnni`, activations quantized too, one scale
+  per 32 values, so the dot product is bytes times bytes into int32: the
+  `vpdpbusd` instruction. nanoinfer's opt-in fast path. The activation
+  quantization has no primitive of its own: it is written in the graph's
+  operations (a max, a divide, a new `round` primitive that rounds half away
+  from zero, a clamp, two sums), and fusion turns it into kernels like
+  anything else.
+
+The tied embedding is a gather table as well as the LM head, so it stays
+float32, as it does in the 23.3078 nanoinfer reports.
+
+**Bitwise agreement needs nanoinfer's order of operations as well as its arithmetic.** Its
+kernel adds into four AVX2 registers of eight lanes, so element `k` goes into
+accumulator `k % 32` by FMA, the registers are combined
+`(a0 + a1) + (a2 + a3)`, the lanes by `low + high` and two `hadd`s, and the
+elements past the last 8-wide group are multiplied and added in order. That
+order is written into the loop IR when the matmul is lowered
+(`lower.int8_dots`), as 32 accumulators and an explicit combine, so the
+kernel fusion emits computes nanoinfer's bits even as scalar C. The loop IR
+gained two nodes for it: `Fma`, so a fused multiply-add happens exactly where
+the IR says (the compile flags still forbid gcc from making one anywhere
+else), and `Dp4`, one lane of `vpdpbusd`, which the AVX2 renderer emits as
+the instruction itself when eight of them read 32 contiguous bytes. Schedules
+then only decide how it runs: four chains as vector registers, weight rows
+outside tokens so a prefill reads each row once, row blocks on the pool.
+
+Correctness:
+
+| Check | Result |
+|---|---|
+| `quantize_int8` against nanoinfer's, with zero rows and exact halves | **identical** integers and scales |
+| `round` in the interpreter and in C, on halves, near-halves, -0.0 and values past 2^23 | **bitwise identical** to `roundf` |
+| Both int8 matmuls against nanoinfer's Rust kernels, at widths exercising every loop and tail of them, 1, 3 and 7 tokens, unfused, fused and scheduled | **bitwise identical** |
+| Every point of the int8 schedule space, on fused SwiGLU (gate and up in one kernel) | **bitwise identical** to the unscheduled kernel |
+| A real `down_proj` on activations of the model's shape | **bitwise identical** to the Rust kernel, both modes |
+| Tiny model in the interpreter against nanoinfer's simulated int8 | **bitwise identical** logits |
+| Tiny model in C against nanoinfer's int8 engine, cached and uncached | tokens identical |
+| Real model, both modes, against nanoinfer's int8 engine in the same mode | **tokens identical** |
+
+**Perplexity**, nanoinfer's held-out text scored as nanoinfer scores it (first
+512 tokens, chunks of 128, 508 predictions):
+
+| | Perplexity |
+|---|---:|
+| nanoinfer, simulated int8 (its README's figure) | 23.307791 |
+| nanoinfer, int8 kernel | 23.307791 |
+| **nanocompile int8**, interpreter | **23.307791** (the same double as nanoinfer's simulated, every digit) |
+| **nanocompile int8**, C | **23.307772** |
+| nanocompile fp32, C | 23.269048 |
+| nanoinfer, int8-vnni kernel | 23.396357 |
+| nanocompile int8-vnni, C | 23.390261 |
+
+The gate was 23.3078, and both of nanocompile's int8 engines round to it. The
+interpreter is nanoinfer's simulated quantization computed the same way, so it
+agrees exactly. The C differs in the sixth significant digit even though its
+int8 kernels are bitwise nanoinfer's, because the rest of the model is not:
+the attention matmuls and the float32 LM head add in index order where
+nanoinfer calls BLAS, the reason phase 2's logits were never bitwise either.
+int8 costs +0.17% against fp32 here, as in nanoinfer; int8 activations cost
++0.52% (nanoinfer measured +0.46% simulated).
+
+**Speed**, decode on the real model, five engines alternating in one fresh
+process, the starting engine rotating each round, 6 rounds of 24 tokens.
+nanoinfer runs at the 4 threads its README measured fastest for its int8
+kernels, nanocompile at its pool's 6:
+
+| | Median step | Decode | Prefill (5 tokens) |
+|---|---:|---:|---:|
+| nanocompile fp32 (phase 4 schedules) | 155.1 ms | 6.45 tok/s | 174.6 ms |
+| **nanocompile int8** | 104.8 ms | **9.54 tok/s** | 200.8 ms |
+| nanocompile int8-vnni | 112.4 ms | 8.90 tok/s | 142.1 ms |
+| nanoinfer int8 | 91.4 ms | 10.94 tok/s | 175.7 ms |
+| nanoinfer int8-vnni | 86.3 ms | 11.58 tok/s | 134.2 ms |
+
+**Read these as ratios.** The machine was loaded while they were
+taken: OneDrive syncing, Defender and the search indexer held about 28% of
+the CPU, and every engine ran at about twice its earlier record. Phase 5's
+own fp32 benchmark, re-run that day, took 374 ms a step against the 75.9 it
+recorded, and nanoinfer's VNNI engine took 86 ms against its README's 32.8.
+What held across three runs that day:
+
+- **int8 is 1.39x to 1.48x faster than fp32**, ahead in all 18 rounds
+  (sign test, one-sided p < 0.0001). The projections read 909 MB a step
+  instead of 1,981.
+- **nanoinfer's int8 engine is 4% to 15% faster than nanocompile's.** The
+  int8 kernels are the same arithmetic, so the gap is elsewhere.
+- **nanocompile's int8-vnni is slower than its int8**, where nanoinfer's is
+  faster.
+
+A per-kernel profile of one decode step says where both of those go:
+
+| Kernel time per step | int8 | int8-vnni |
+|---|---:|---:|
+| int8 projections | 39.0 ms | **23.0 ms** |
+| activation quantization | n/a | 5.5 ms |
+| float32 matmuls (LM head, attention) | 55.2 ms | 45.9 ms |
+| everything | 95.6 ms | 75.3 ms |
+
+The VNNI kernels are 1.7x faster than the float-activation ones, and the
+step spends less time in kernels. It loses end to end on calls. Written in
+graph operations, the activation quantization fuses into 6 small kernels per
+quantized activation: 576 more per step, 895 in all against 319, and the
+runtime's Python loop does per-call work (pointer arrays, offsets) for each
+one. That cost is what phase 7 exists to remove, with one call per
+token. The other large cost is the float32 LM head, 545 MB a step in both
+modes, and most of the float32 matmul time. It stays float32 here by the
+roadmap's choice, matching the 23.3078 configuration; nanoinfer has since
+made int8 embeddings its default, for 0.02 points of perplexity.
+
+```
+python -m bench.phase6 --part speed
+python -m bench.phase6 --part perplexity
+```
+
+In code, `Qwen2(config, weights, run=CBackend(), quantization="int8")`, or
+`quantize.quantize(graph, "f32" | "int8")` on any graph.
 
 ## Measuring
 
