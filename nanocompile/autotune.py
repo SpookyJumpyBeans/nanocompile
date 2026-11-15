@@ -542,7 +542,9 @@ class Autotuner:
             "operands": operands,
             "symbols": list(symbols),
             "workloads": [[n, sorted(b.items()), w] for n, b, w in self.workloads],
-            "space": {k: [list(map(str, v)) for v in d.values()] for k, d in schedules.SPACES.items()},
+            # The kernel's own space: a new class of kernel must not invalidate
+            # every other class's winners, and a changed space must.
+            "space": [list(map(str, v)) for v in schedules.SPACES[schedules.kernel_class(kernel)].values()],
         }, sort_keys=True)
         return hashlib.sha256(material.encode()).hexdigest()[:20]
 
