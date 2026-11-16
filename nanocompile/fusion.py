@@ -49,7 +49,8 @@ import numpy as np
 from nanocompile import dtypes
 from nanocompile import loopir as L
 from nanocompile.ir import Graph, Node
-from nanocompile.lower import ELEMENTWISE, Buffer, Call, Program, View, _cast, contiguous_strides
+from nanocompile.lower import (ELEMENTWISE, Buffer, Call, Program, View, _cast, contiguous_strides, int8_dots,
+                               int8_vnni_dots)
 from nanocompile.symbolic import Dim, Expr, as_expr, canonical, dims_equal, product, shapes_equal
 
 INDEX_OPS = frozenset({"reshape", "permute", "broadcast", "slice", "concat"})
@@ -57,6 +58,7 @@ LEAF_OPS = frozenset({"input", "weight", "const"})
 REDUCE_OPS = frozenset({"reduce_sum", "reduce_max"})
 TRANSCENDENTAL = frozenset({"exp", "sin", "cos"})
 ELEMENTWISE_OPS = frozenset(ELEMENTWISE) | {"cast", "iota", "dim"}
+MATMUL_OPS = frozenset({"matmul", "matmul_i8", "matmul_i8_vnni"})
 
 
 class _Refuse(Exception):
@@ -133,7 +135,7 @@ class _Planner:
                         found[u] = found.get(u, False)
                     stack.extend(self.users[u])
                 else:
-                    found[u] = found.get(u, False) or u.op == "matmul"
+                    found[u] = found.get(u, False) or u.op in MATMUL_OPS
             self._consumers[n] = sorted(found.items(), key=lambda kv: self.order[kv[0]])
         return self._consumers[n]
 
@@ -152,7 +154,7 @@ class _Planner:
                 continue
             elif n.op == "gather":
                 realize(n)
-            elif n.op == "matmul":
+            elif n.op in MATMUL_OPS:
                 if n in epilogue:
                     root[n] = epilogue[n]
                 else:
@@ -221,7 +223,7 @@ class _Planner:
                         row[n] = t
                         claimed[t] = "row"
                         changed = True
-                elif n.op == "matmul" and (n, "epilogue") not in self.refused:
+                elif n.op in MATMUL_OPS and (n, "epilogue") not in self.refused:
                     direct = self.users[n]
                     if not direct or any(u.op not in ELEMENTWISE_OPS for u in direct):
                         continue
@@ -232,6 +234,12 @@ class _Planner:
                         continue
                     k = n.inputs[0].shape[-1]
                     if any(not dims_equal(m.inputs[0].shape[-1], k) for m, r in epilogue.items() if r is t):
+                        continue
+                    # Matmuls sharing a kernel share its k loop: the same kind,
+                    # and for int8 activations the same activations, whose
+                    # block scales the shared loop reads.
+                    if any(m.op != n.op or (n.op == "matmul_i8_vnni" and m.inputs[:3] != n.inputs[:3])
+                           for m, r in epilogue.items() if r is t):
                         continue
                     epilogue[n] = t
                     claimed[t] = "epilogue"
@@ -549,8 +557,10 @@ class _KernelGen:
         n = self.node
         if self.root is None:
             body, kind = self._elementwise(n), "copy"
-        elif self.plan.matmuls_of(n) or n.op == "matmul":
-            body, kind = self._matmul(n), "matmul+epilogue" if self.plan.matmuls_of(n) else "matmul"
+        elif self.plan.matmuls_of(n) or n.op in MATMUL_OPS:
+            matmuls = self.plan.matmuls_of(n) or [n]
+            body = self._matmul(n)
+            kind = matmuls[0].op + ("+epilogue" if self.plan.matmuls_of(n) else "")
         elif self.plan.reductions_of(n):
             body, kind = self._row(n), "row"
         elif n.op in REDUCE_OPS:
@@ -642,6 +652,8 @@ class _KernelGen:
     def _matmul(self, t: Node) -> list[L.Stmt]:
         """A k loop over every fused matmul at once, then the epilogue."""
         matmuls = sorted(self.plan.matmuls_of(t), key=lambda x: self.fuser.graph.ids[x]) or [t]
+        if matmuls[0].op != "matmul":
+            return self._matmul_i8(t, matmuls)
         names, extents, idx = self._loops(t.shape)
         k = L.Var("k")
         kbody = self.block()
@@ -657,6 +669,42 @@ class _KernelGen:
         inner.append(L.Loop("k", L.from_dim(matmuls[0].inputs[0].shape[-1], self.symbols), tuple(kbody)))
         for name, m in accs:
             self.accs[m] = (L.Var(name, m.dtype), tuple(idx))
+        epilogue = self.block()
+        epilogue.append(self._store(t.shape, idx, self.value(t, idx)))
+        inner += epilogue
+        return L.loop_nest(names, extents, inner)
+
+    def _matmul_i8(self, t: Node, matmuls: list[Node]) -> list[L.Stmt]:
+        """nanoinfer's int8 dot per fused matmul, in shared loops, then the epilogue.
+
+        Every operand of an int8 matmul is realized or a weight, so each read
+        is a plain load and the dot templates (``lower.int8_dots``) see
+        nothing but loads. The scaled result of each is a ``Let`` the
+        epilogue reads, as a float matmul's accumulator is.
+        """
+        names, extents, idx = self._loops(t.shape)
+        lead, row = idx[:-1], idx[-1]
+        stmts = self.block()
+        first = matmuls[0]
+        if first.op == "matmul_i8":
+            dots = [(str(i), lambda at, m=m: self.value(m.inputs[1], [row, at]),
+                     lambda at, m=m: self.value(m.inputs[0], lead + [at])) for i, m in enumerate(matmuls)]
+            body, sums = int8_dots(dots, int(first.inputs[1].shape[1]))
+            results = [L.binary("mul", total, self.value(m.inputs[2], [row])) for total, m in zip(sums, matmuls)]
+        else:
+            dots = [(str(i), lambda at, m=m: self.value(m.inputs[3], [row, at]),
+                     lambda at, m=m: self.value(m.inputs[0], lead + [at])) for i, m in enumerate(matmuls)]
+            body, sums = int8_vnni_dots(dots, lambda b: self.value(first.inputs[1], lead + [b]),
+                                        int(first.inputs[3].shape[1]), first.attrs["block"])
+            offset = self.value(first.inputs[2], lead + [L.const(0)])
+            results = [L.binary("mul", L.binary("sub", total, offset), self.value(m.inputs[4], [row]))
+                       for total, m in zip(sums, matmuls)]
+        if stmts:
+            raise AssertionError("an int8 matmul operand was computed in the kernel, not loaded")
+        inner: list[L.Stmt] = list(body)
+        for i, (m, value) in enumerate(zip(matmuls, results)):
+            inner.append(L.Let(f"y{i}", value))
+            self.accs[m] = (L.Var(f"y{i}", dtypes.f32), tuple(idx))
         epilogue = self.block()
         epilogue.append(self._store(t.shape, idx, self.value(t, idx)))
         inner += epilogue

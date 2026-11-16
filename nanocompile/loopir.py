@@ -87,7 +87,7 @@ class Binary:
 
 @dataclass(frozen=True)
 class Unary:
-    """``neg exp sqrt reciprocal sin cos``."""
+    """``neg exp sqrt reciprocal sin cos round``. ``round`` is C's ``roundf``: half away from zero."""
 
     op: str
     a: "Scalar"
@@ -117,7 +117,40 @@ class Local:
     dtype: DType
 
 
-Scalar = Const | Var | Sym | Load | Binary | Unary | Select | Cast | Local
+@dataclass(frozen=True)
+class Fma:
+    """``a * b + c`` rounded once, as C's ``fmaf`` and AVX2's ``vfmadd`` compute it.
+
+    The compile flags forbid gcc from contracting ``a * b + c`` on its own, so
+    a fused multiply-add happens exactly where the IR says one does, and
+    nowhere else. Phase 6 needs it to say so: nanoinfer's int8 kernel
+    accumulates with FMA, and agreeing with it bit for bit means doing the
+    same.
+    """
+
+    a: "Scalar"
+    b: "Scalar"
+    c: "Scalar"
+    dtype: DType
+
+
+@dataclass(frozen=True)
+class Dp4:
+    """One lane of VPDPBUSD: ``sum over j < 4 of (a[j] + 128) * b[j]``, as int32.
+
+    ``a`` and ``b`` are int8 loads naming the first of four consecutive bytes.
+    The ``+ 128`` is the instruction's view of a signed weight byte XORed with
+    0x80, which is what lets it multiply signed weights by signed activations;
+    whoever accumulates these subtracts ``128 * sum(b)`` afterwards. Every
+    term fits in 17 bits and the sum in 19, so the result is exact.
+    """
+
+    a: "Load"
+    b: "Load"
+    dtype: DType = dtypes.i32
+
+
+Scalar = Const | Var | Sym | Load | Binary | Unary | Select | Cast | Local | Fma | Dp4
 
 COMPARISONS = frozenset({"le", "lt", "ne", "or"})
 
@@ -361,6 +394,13 @@ def map_scalar(x: Scalar, f) -> Scalar:
         x = Select(map_scalar(x.cond, f), map_scalar(x.a, f), map_scalar(x.b, f), x.dtype)
     elif isinstance(x, Cast):
         x = Cast(map_scalar(x.a, f), x.dtype)
+    elif isinstance(x, Fma):
+        x = Fma(map_scalar(x.a, f), map_scalar(x.b, f), map_scalar(x.c, f), x.dtype)
+    elif isinstance(x, Dp4):
+        a, b = map_scalar(x.a, f), map_scalar(x.b, f)
+        if not (isinstance(a, Load) and isinstance(b, Load)):
+            raise TypeError("a Dp4 reads its bytes straight from memory")
+        x = Dp4(a, b, x.dtype)
     return f(x)
 
 
@@ -406,6 +446,13 @@ def walk_scalar(x: Scalar):
         yield from walk_scalar(x.a)
     elif isinstance(x, Select):
         yield from walk_scalar(x.cond)
+        yield from walk_scalar(x.a)
+        yield from walk_scalar(x.b)
+    elif isinstance(x, Fma):
+        yield from walk_scalar(x.a)
+        yield from walk_scalar(x.b)
+        yield from walk_scalar(x.c)
+    elif isinstance(x, Dp4):
         yield from walk_scalar(x.a)
         yield from walk_scalar(x.b)
 

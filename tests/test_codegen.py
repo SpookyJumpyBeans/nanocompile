@@ -69,6 +69,7 @@ EXACT_UNARY = {
     "neg": lambda x: -x,
     "sqrt": lambda x: x.sqrt(),
     "reciprocal": lambda x: x.reciprocal(),
+    "round": lambda x: x.round(),
 }
 APPROX_UNARY = {
     "exp": lambda x: x.exp(),
@@ -231,6 +232,7 @@ def test_every_primitive_is_tested_here():
         "input", "weight", "const", "iota", "dim", "add", "sub", "mul", "div",
         "less_equal", "where", "cast", "reduce_sum", "reduce_max", "reshape",
         "permute", "broadcast", "slice", "concat", "matmul", "gather",
+        "matmul_i8", "matmul_i8_vnni",      # in test_int8.py, against nanoinfer's kernels
     } | set(EXACT_UNARY) | set(APPROX_UNARY)
     assert covered == set(OPS)
 

@@ -15,10 +15,11 @@ The primitives, by family:
 
     leaves       input, weight, const, iota, dim
     elementwise  add, sub, mul, div, less_equal, where,
-                 neg, exp, sqrt, reciprocal, sin, cos, cast
+                 neg, exp, sqrt, reciprocal, sin, cos, round, cast
     reductions   reduce_sum, reduce_max
     movement     reshape, permute, broadcast, slice, concat
-    other        matmul, gather
+    matmul       matmul, matmul_i8, matmul_i8_vnni
+    other        gather
 
 Elementwise primitives require their operands to have identical shapes.
 NumPy-style implicit broadcasting is a frontend convenience that inserts
@@ -240,7 +241,9 @@ def _unary(name: str, float_only: bool) -> None:
 
 
 _unary("neg", float_only=False)
-for _name in ("exp", "sqrt", "reciprocal", "sin", "cos"):
+# round is half away from zero, as C's roundf and Rust's f32::round: phase 6
+# quantizes activations with it, and NumPy's round (half to even) is not it.
+for _name in ("exp", "sqrt", "reciprocal", "sin", "cos", "round"):
     _unary(_name, float_only=True)
 
 
@@ -373,6 +376,67 @@ def _infer_matmul(inputs, attrs):
     if not dims_equal(a.shape[-1], b.shape[-2]):
         raise _fail("matmul", f"inner dimensions differ: {a.type_str} @ {b.type_str}")
     return a.dtype, a.shape[:-1] + (b.shape[-1],)
+
+
+def _int8_weight(op: str, q: Node, scales: Node, k: Dim) -> Dim:
+    """Check a per-row int8 weight ``q: i8[N, K]`` and ``scales: f32[N]``; return ``N``."""
+    if q.dtype != dtypes.i8 or q.rank != 2:
+        raise _fail(op, f"weights must be i8[N, K], got {q.type_str}")
+    if scales.dtype != dtypes.f32 or scales.rank != 1 or not dims_equal(scales.shape[0], q.shape[0]):
+        raise _fail(op, f"expected one f32 scale per row of {q.type_str}, got {scales.type_str}")
+    if not dims_equal(q.shape[1], k):
+        raise _fail(op, f"activations have width {k}, weights {q.type_str} expect {q.shape[1]}")
+    return q.shape[0]
+
+
+@_register("matmul_i8", "matmul", 3)
+def _infer_matmul_i8(inputs, attrs):
+    """``x @ (q * scales[:, None]).T`` with ``q`` per-row int8 (phase 6).
+
+    ``x: f32[..., K]``, ``q: i8[N, K]``, ``scales: f32[N]``. The activations
+    stay float32. Each output is one row of ``q``, widened, dotted with ``x``,
+    then scaled once: ``scales[n] * sum_k q[n, k] * x[k]``. The order of that
+    sum is the lowering's to choose; the C lowering follows nanoinfer's
+    kernel exactly (see ``fusion``).
+    """
+    x, q, scales = inputs
+    if x.dtype != dtypes.f32 or x.rank < 1:
+        raise _fail("matmul_i8", f"activations must be f32[..., K], got {x.type_str}")
+    n = _int8_weight("matmul_i8", q, scales, x.shape[-1])
+    return dtypes.f32, x.shape[:-1] + (n,)
+
+
+@_register("matmul_i8_vnni", "matmul", 5)
+def _infer_matmul_i8_vnni(inputs, attrs):
+    """int8 weights times int8 activations, one activation scale per ``block`` values.
+
+    ``xq: i8[..., K]`` and ``xs: f32[..., K / block]`` are the activations
+    quantized block by block, ``offset: f32[..., 1]`` is
+    ``128 * sum_b(sum(xq in block b) * xs[b])``, and ``q``, ``scales`` are the
+    weights as for ``matmul_i8``. The result is
+    ``(sum_b xs[b] * sum_{k in b} (q[n, k] + 128) * xq[k] - offset) * scales[n]``:
+    the ``+ 128`` is how VPDPBUSD multiplies signed bytes, and ``offset``
+    takes it back out, once per token rather than once per row.
+
+    ``block`` is a power of two of at least 32 dividing ``K``, so every
+    32-byte VPDPBUSD group lies inside one block.
+    """
+    xq, xs, offset, q, scales = inputs
+    block = attrs["block"]
+    if not (isinstance(block, int) and block >= 32 and block & (block - 1) == 0):
+        raise _fail("matmul_i8_vnni", f"block must be a power of two >= 32, got {block!r}")
+    if xq.dtype != dtypes.i8 or xq.rank < 1:
+        raise _fail("matmul_i8_vnni", f"activations must be i8[..., K], got {xq.type_str}")
+    k = xq.shape[-1]
+    if not isinstance(k, int) or k % block:
+        raise _fail("matmul_i8_vnni", f"width {k} is not a whole number of blocks of {block}")
+    lead = xq.shape[:-1]
+    if xs.dtype != dtypes.f32 or not shapes_equal(xs.shape, lead + (k // block,)):
+        raise _fail("matmul_i8_vnni", f"expected f32{format_shape(lead + (k // block,))} scales, got {xs.type_str}")
+    if offset.dtype != dtypes.f32 or not shapes_equal(offset.shape, lead + (1,)):
+        raise _fail("matmul_i8_vnni", f"expected f32{format_shape(lead + (1,))} offsets, got {offset.type_str}")
+    n = _int8_weight("matmul_i8_vnni", q, scales, k)
+    return dtypes.f32, lead + (n,)
 
 
 @_register("gather", "gather", 2)

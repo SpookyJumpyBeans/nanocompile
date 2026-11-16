@@ -219,6 +219,7 @@ class Tensor:
     def reciprocal(self) -> "Tensor": return self._new("reciprocal", self)
     def sin(self) -> "Tensor": return self._new("sin", self)
     def cos(self) -> "Tensor": return self._new("cos", self)
+    def round(self) -> "Tensor": return self._new("round", self)
 
     def cast(self, dtype: DType) -> "Tensor":
         return self if dtype == self.dtype else self._new("cast", self, dtype=dtype)

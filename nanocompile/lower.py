@@ -13,7 +13,7 @@ contiguously; reshaping a transposed or broadcast view needs the data moved.
 Then a ``copy`` kernel materializes the view and the reshape is a view of the
 copy. Those copies are real traffic and are counted like any other kernel.
 
-Everything else (arithmetic, reductions, ``concat``, ``matmul``, ``gather``,
+Everything else (arithmetic, reductions, ``concat``, the matmuls, ``gather``,
 ``iota``, ``dim``) is one kernel per node, writing a fresh contiguous buffer.
 No fusion: that is phase 3, and this phase's numbers are the baseline it is
 measured against.
@@ -154,6 +154,7 @@ ELEMENTWISE: dict[str, Callable[..., L.Scalar]] = {
     "reciprocal": lambda a: L.Unary("reciprocal", a, a.dtype),
     "sin": lambda a: L.Unary("sin", a, a.dtype),
     "cos": lambda a: L.Unary("cos", a, a.dtype),
+    "round": lambda a: L.Unary("round", a, a.dtype),
     "copy": lambda a: a,
 }
 
@@ -266,6 +267,154 @@ def _matmul_kernel(b: _KernelBuilder, node: Node) -> L.Kernel:
         b.store(node.shape, idx, acc),
     ]
     return b.kernel("matmul", L.loop_nest(names, extents, inner), node.shape, node.dtype)
+
+
+# -- int8 dot products (phase 6) ---------------------------------------------
+#
+# The f32 matmul above adds in index order, one accumulator. nanoinfer's int8
+# kernels do not, and phase 6's gate is agreement with them bit for bit, so
+# their order is written into the IR here rather than left to a schedule:
+#
+# * **Float activations** (nanoinfer's ``dot_i8_avx2``): 32 accumulators,
+#   element ``k`` of each 32-wide block into accumulator ``k % 32`` by FMA;
+#   then whole 8-wide groups left over into accumulators 0..7; then the 32
+#   combined as AVX2 combines its four registers and eight lanes; then the
+#   elements past the last group, multiply and add, in order.
+# * **int8 activations** (``dot_i8_blocked_vnni``): the same 32 accumulators,
+#   each 4 bytes one VPDPBUSD lane (``Dp4``), each 32-byte group's eight
+#   lanes converted to float and FMA'd by that group's block scale, groups of
+#   a 128-byte stride into accumulators 0..31 and leftover groups into 0..7.
+#
+# Accumulator ``8 * c + l`` is lane ``l`` of what nanoinfer calls ``acc{c}``.
+# Written this way, the kernel as fusion emits it, in scalar C, already
+# computes nanoinfer's bits; a schedule only decides how it runs. Several dots
+# share one set of loops (SwiGLU's gate and up), each with its own arrays.
+
+DotLoad = Callable[[L.Scalar], L.Scalar]
+CHAINS, LANES8 = 4, 8
+WIDTH = CHAINS * LANES8       # 32: elements per iteration of the main loop
+
+
+def _combine(acc: str, h: str, total: str) -> list[L.Stmt]:
+    """The 32 accumulators summed in AVX2's order, into ``Let total``.
+
+    ``(acc0 + acc1) + (acc2 + acc3)`` lane by lane, then lanes ``j`` and
+    ``j + 4`` (``low + high``), then two ``hadd``: ``(u0 + u1) + (u2 + u3)``.
+    """
+    def a(i: int | L.Scalar) -> L.Scalar:
+        return L.Local(acc, i if not isinstance(i, int) else L.const(i), dtypes.f32)
+
+    l = L.Var("kh")
+    lanes = [L.add(L.const(LANES8 * c), l) for c in range(CHAINS)]
+    pair01 = L.binary("add", a(lanes[0]), a(lanes[1]))
+    pair23 = L.binary("add", a(lanes[2]), a(lanes[3]))
+    hv = lambda j: L.Local(h, L.const(j), dtypes.f32)
+    u = [L.binary("add", hv(j), hv(j + 4)) for j in range(4)]
+    return [
+        L.Array(h, LANES8, L.const(0.0, dtypes.f32)),
+        L.Loop("kh", L.const(LANES8), (L.ArrayStore(h, l, L.binary("add", pair01, pair23)),)),
+        L.Let(total, L.binary("add", L.binary("add", u[0], u[1]), L.binary("add", u[2], u[3]))),
+    ]
+
+
+def int8_dots(dots: list[tuple[str, DotLoad, DotLoad]], k: int) -> tuple[list[L.Stmt], list[L.Var]]:
+    """``sum_k w(k) * x(k)`` per dot, int8 ``w`` widened, float ``x``, in nanoinfer's order.
+
+    ``dots`` is ``(name, w, x)``: ``w`` and ``x`` give the load at element
+    ``k``. Returns the statements and, per dot, the unscaled sum.
+    """
+    wide, groups = k // WIDTH * WIDTH, (k % WIDTH) // LANES8
+    tail = wide + groups * LANES8
+    stmts: list[L.Stmt] = [L.Array(f"acc_{n}", WIDTH, L.const(0.0, dtypes.f32)) for n, _, _ in dots]
+
+    def update(acc_index: L.Scalar, at: L.Scalar) -> list[L.Stmt]:
+        return [L.ArrayStore(f"acc_{n}", acc_index,
+                             L.Fma(L.Cast(w(at), dtypes.f32), x(at), L.Local(f"acc_{n}", acc_index, dtypes.f32),
+                                   dtypes.f32))
+                for n, w, x in dots]
+
+    if wide:
+        c, l = L.Var("kc"), L.Var("kl")
+        lane = L.add(L.mul(c, L.const(LANES8)), l)
+        at = L.add(L.mul(L.Var("k0"), L.const(WIDTH)), lane)
+        stmts.append(L.Loop("k0", L.const(k // WIDTH), (
+            L.Loop("kc", L.const(CHAINS), (L.Loop("kl", L.const(LANES8), tuple(update(lane, at))),)),)))
+    if groups:
+        l = L.Var("kg")
+        at = L.add(L.const(wide), L.add(L.mul(L.Var("k1"), L.const(LANES8)), l))
+        stmts.append(L.Loop("k1", L.const(groups), (L.Loop("kg", L.const(LANES8), tuple(update(l, at))),)))
+    sums = []
+    for n, w, x in dots:
+        stmts += _combine(f"acc_{n}", f"h_{n}", f"sum_{n}")
+        sums.append(L.Var(f"sum_{n}", dtypes.f32))
+    if tail < k:
+        at = L.add(L.const(tail), L.Var("kr"))
+        stmts.append(L.Loop("kr", L.const(k - tail), tuple(
+            L.Assign(f"sum_{n}", L.binary("add", L.Var(f"sum_{n}", dtypes.f32),
+                                          L.binary("mul", L.Cast(w(at), dtypes.f32), x(at))))
+            for n, w, x in dots)))
+    return stmts, sums
+
+
+VNNI_GROUP = 32               # bytes per VPDPBUSD
+VNNI_STRIDE = CHAINS * VNNI_GROUP
+
+
+def int8_vnni_dots(dots: list[tuple[str, DotLoad, DotLoad]], scale: DotLoad, k: int,
+                   block: int) -> tuple[list[L.Stmt], list[L.Var]]:
+    """``sum_b scale(b) * sum_{k in b} (w(k) + 128) * x(k)`` per dot, both int8.
+
+    ``scale(b)`` loads block ``b``'s activation scale. ``k`` is a whole number
+    of blocks and a block a whole number of 32-byte groups (``matmul_i8_vnni``
+    checks both), so there is no tail shorter than a group.
+    """
+    assert k % block == 0 and block % VNNI_GROUP == 0
+    stride, groups = k // VNNI_STRIDE * VNNI_STRIDE, (k % VNNI_STRIDE) // VNNI_GROUP
+    stmts: list[L.Stmt] = [L.Array(f"acc_{n}", WIDTH, L.const(0.0, dtypes.f32)) for n, _, _ in dots]
+
+    def update(acc_index: L.Scalar, group: L.Scalar, l: L.Var) -> list[L.Stmt]:
+        at = L.add(group, L.mul(l, L.const(4)))
+        s = scale(L.idiv(group, L.const(block)))
+        return [L.ArrayStore(f"acc_{n}", acc_index,
+                             L.Fma(L.Cast(L.Dp4(w(at), x(at)), dtypes.f32), s,
+                                   L.Local(f"acc_{n}", acc_index, dtypes.f32), dtypes.f32))
+                for n, w, x in dots]
+
+    if stride:
+        c, l = L.Var("kc"), L.Var("kl")
+        group = L.add(L.mul(L.Var("k0"), L.const(VNNI_STRIDE)), L.mul(c, L.const(VNNI_GROUP)))
+        lane = L.add(L.mul(c, L.const(LANES8)), l)
+        stmts.append(L.Loop("k0", L.const(k // VNNI_STRIDE), (
+            L.Loop("kc", L.const(CHAINS), (L.Loop("kl", L.const(LANES8), tuple(update(lane, group, l))),)),)))
+    if groups:
+        l = L.Var("kg")
+        group = L.add(L.const(stride), L.mul(L.Var("k1"), L.const(VNNI_GROUP)))
+        stmts.append(L.Loop("k1", L.const(groups), (L.Loop("kg", L.const(LANES8), tuple(update(l, group, l))),)))
+    sums = []
+    for n, _, _ in dots:
+        stmts += _combine(f"acc_{n}", f"h_{n}", f"sum_{n}")
+        sums.append(L.Var(f"sum_{n}", dtypes.f32))
+    return stmts, sums
+
+
+def _matmul_i8_kernel(b: _KernelBuilder, node: Node) -> L.Kernel:
+    """One int8 dot per output, then its scale: phase 2's unfused form of either int8 matmul."""
+    names = _names("i", node.rank)
+    extents = b.extents(node.shape)
+    idx = L.substitute_unit_loops(names, extents)
+    lead, row = idx[:-1], idx[-1]
+    if node.op == "matmul_i8":
+        k = int(b.operands[1].shape[1])
+        stmts, (total,) = int8_dots([("0", lambda at: b.load(1, [row, at]), lambda at: b.load(0, lead + [at]))], k)
+        value = L.binary("mul", total, b.load(2, [row]))
+    else:
+        k, block = int(b.operands[3].shape[1]), node.attrs["block"]
+        stmts, (total,) = int8_vnni_dots(
+            [("0", lambda at: b.load(3, [row, at]), lambda at: b.load(0, lead + [at]))],
+            lambda blk: b.load(1, lead + [blk]), k, block)
+        value = L.binary("mul", L.binary("sub", total, b.load(2, lead + [L.const(0)])), b.load(4, [row]))
+    inner = stmts + [b.store(node.shape, idx, value)]
+    return b.kernel(node.op, L.loop_nest(names, extents, inner), node.shape, node.dtype)
 
 
 def _gather_kernel(b: _KernelBuilder, node: Node) -> L.Kernel:
@@ -401,6 +550,8 @@ class _Lowering:
             kernel = _reduce_kernel(b, node, node.attrs["axis"] % node.rank)
         elif op == "matmul":
             kernel = _matmul_kernel(b, node)
+        elif op in ("matmul_i8", "matmul_i8_vnni"):
+            kernel = _matmul_i8_kernel(b, node)
         elif op == "gather":
             kernel = _gather_kernel(b, node)
         elif op == "concat":

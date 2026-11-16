@@ -152,6 +152,55 @@ def _matmul(node, args, bound):
     return np.matmul(a, b)
 
 
+def _dequantize(q: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    """Per-row int8 back to float32, by nanoinfer's ``QuantizedTensor.dequantize``."""
+    return (q.astype(np.float32) * scales[:, None]).astype(np.float32)
+
+
+def _matmul_i8(node, args, bound):
+    """Simulated quantization: the weights dequantized, then a float32 matmul.
+
+    This is what nanoinfer's perplexity figures measure, and it is the
+    meaning here: the generated kernel never dequantizes, and scales each
+    finished sum once instead of each weight, so it agrees with this to
+    float32 rounding, not bitwise. Its bitwise reference is nanoinfer's Rust
+    kernel, which the tests run directly.
+    """
+    x, q, scales = args
+    return np.matmul(x, _dequantize(q, scales).T)
+
+
+def _matmul_i8_vnni(node, args, bound):
+    """The block sums exactly in integers, their combination in float64.
+
+    The kernel combines the block sums in float32 in a particular order, so
+    this agrees with it to float32 rounding; the order is tested against
+    nanoinfer's Rust kernel instead.
+    """
+    xq, xs, offset, q, scales = args
+    block = node.attrs["block"]
+    lead, k = xq.shape[:-1], xq.shape[-1]
+    blocks = k // block
+    a = xq.reshape(lead + (blocks, block)).astype(np.int64)
+    w = q.reshape(q.shape[0], blocks, block).astype(np.int64) + 128
+    sums = np.einsum("...bj,nbj->...nb", a, w)
+    acc = np.einsum("...nb,...b->...n", sums.astype(np.float64), xs.astype(np.float64))
+    out = (acc - offset.astype(np.float64)) * scales.astype(np.float64)
+    return out.astype(np.float32)
+
+
+def _round(node, args, bound):
+    """Half away from zero, as C's ``roundf``. NumPy's ``round`` sends halves to even.
+
+    ``|x| + 0.5`` is exact in float64 for every float32 below 2**23, and
+    every float32 at or above it is already an integer.
+    """
+    (x,) = args
+    wide = x.astype(np.float64)
+    rounded = np.copysign(np.floor(np.abs(wide) + 0.5), wide)
+    return np.where(np.abs(wide) < 2.0**23, rounded, wide).astype(x.dtype)
+
+
 KERNELS: dict[str, Kernel] = {
     "const": lambda node, args, bound: node.attrs["value"],
     "iota": _iota,
@@ -168,6 +217,7 @@ KERNELS: dict[str, Kernel] = {
     "reciprocal": lambda node, args, bound: np.reciprocal(args[0]),
     "sin": lambda node, args, bound: np.sin(args[0]),
     "cos": lambda node, args, bound: np.cos(args[0]),
+    "round": _round,
     "cast": lambda node, args, bound: args[0].astype(node.dtype.numpy),
     # dtype pinned: NumPy would sum int8 into a wider type.
     "reduce_sum": lambda node, args, bound: np.sum(
@@ -180,6 +230,8 @@ KERNELS: dict[str, Kernel] = {
     "slice": _slice,
     "concat": lambda node, args, bound: np.concatenate(args, axis=node.attrs["axis"]),
     "matmul": _matmul,
+    "matmul_i8": _matmul_i8,
+    "matmul_i8_vnni": _matmul_i8_vnni,
     "gather": _gather,
 }
 
