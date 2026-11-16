@@ -30,7 +30,7 @@ tools use it, and `nanocompile/` never imports it.
 | 3 | Fusion: elementwise, reductions, matmul epilogues; bytes moved per token, counted exactly | **done**: bitwise identical to unfused, 62 to 13 kernels per block, 1.18x faster |
 | 4 | Schedules: tiling, AVX2 vectorization, a persistent thread pool; matmul against OpenBLAS and nanoinfer's Rust kernel | **done**: bitwise identical to phase 3, 3.1x faster, matmul at the roofline (199 of 200.5 GFLOP/s) |
 | 5 | Autotuning over the schedule space, on a machine known to be noisy | **done**: bitwise identical, 4% faster decode, winner unstable on 7 of 20 kernels and reported |
-| 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | **done**: bitwise identical to nanoinfer's Rust kernels, perplexity 23.3078, 1.4x faster decode than fp32, nanoinfer still 4 to 15% ahead |
+| 6 | INT8 lowering with AVX-VNNI; bitwise agreement with nanoinfer's int8 kernel | **done**: bitwise identical to nanoinfer's Rust kernels, perplexity 23.3078, 1.61x faster decode than fp32, level with nanoinfer |
 | 7 | Whole-model compilation: one library, one call per token, a static memory plan | not started |
 | 8 | Benchmark against nanoinfer and llama.cpp on identical hardware | not started |
 
@@ -709,50 +709,50 @@ int8 costs +0.17% against fp32 here, as in nanoinfer; int8 activations cost
 **Speed**, decode on the real model, five engines alternating in one fresh
 process, the starting engine rotating each round, 6 rounds of 24 tokens.
 nanoinfer runs at the 4 threads its README measured fastest for its int8
-kernels, nanocompile at its pool's 6:
+kernels, nanocompile at its pool's 6. Both keep the LM head float32, the
+configuration of the 23.3078:
 
-| | Median step | Decode | Prefill (5 tokens) |
-|---|---:|---:|---:|
-| nanocompile fp32 (phase 4 schedules) | 155.1 ms | 6.45 tok/s | 174.6 ms |
-| **nanocompile int8** | 104.8 ms | **9.54 tok/s** | 200.8 ms |
-| nanocompile int8-vnni | 112.4 ms | 8.90 tok/s | 142.1 ms |
-| nanoinfer int8 | 91.4 ms | 10.94 tok/s | 175.7 ms |
-| nanoinfer int8-vnni | 86.3 ms | 11.58 tok/s | 134.2 ms |
+| | Median step | Min | Decode | Prefill (5 tokens) |
+|---|---:|---:|---:|---:|
+| nanocompile fp32 (phase 4 schedules) | 75.9 ms | 69.0 ms | 13.17 tok/s | 80.7 ms |
+| **nanocompile int8** | **47.1 ms** | 43.6 ms | **21.22 tok/s** | 80.1 ms |
+| nanocompile int8-vnni | 50.6 ms | 45.6 ms | 19.77 tok/s | 58.4 ms |
+| nanoinfer int8 | 48.0 ms | 40.5 ms | 20.85 tok/s | 83.0 ms |
+| nanoinfer int8-vnni | 51.1 ms | 42.6 ms | 19.58 tok/s | 66.5 ms |
 
-**Read these as ratios.** The machine was loaded while they were
-taken: OneDrive syncing, Defender and the search indexer held about 28% of
-the CPU, and every engine ran at about twice its earlier record. Phase 5's
-own fp32 benchmark, re-run that day, took 374 ms a step against the 75.9 it
-recorded, and nanoinfer's VNNI engine took 86 ms against its README's 32.8.
-What held across three runs that day:
+**int8 decodes 1.61x faster than fp32**, ahead in all 6 rounds (sign test,
+one-sided p = 0.016), because the projections read 909 MB a step instead of
+1,981. **Against nanoinfer it is level**: 1 to 2% ahead on the median, ahead in 4
+rounds of 6 in int8 and 4 of 6 in int8-vnni, which no test separates from
+chance. The fp32 row is phase 5's hand-written 75.9 ms reproduced, the check
+that the machine was in the state the earlier phases were measured in.
 
-- **int8 is 1.39x to 1.48x faster than fp32**, ahead in all 18 rounds
-  (sign test, one-sided p < 0.0001). The projections read 909 MB a step
-  instead of 1,981.
-- **nanoinfer's int8 engine is 4% to 15% faster than nanocompile's.** The
-  int8 kernels are the same arithmetic, so the gap is elsewhere.
-- **nanocompile's int8-vnni is slower than its int8**, where nanoinfer's is
-  faster.
-
-A per-kernel profile of one decode step says where both of those go:
+**int8-vnni is slower than int8 in both engines**, though it prefills
+faster. A profile of one decode step, the two modes alternating, medians:
 
 | Kernel time per step | int8 | int8-vnni |
 |---|---:|---:|
-| int8 projections | 39.0 ms | **23.0 ms** |
-| activation quantization | n/a | 5.5 ms |
-| float32 matmuls (LM head, attention) | 55.2 ms | 45.9 ms |
-| everything | 95.6 ms | 75.3 ms |
+| int8 projections | 15.0 ms | **12.0 ms** |
+| activation quantization | n/a | 4.0 ms |
+| float32 matmuls (LM head, attention) | 30.1 ms | 29.9 ms |
+| all kernels | 45.7 ms | 46.4 ms |
 
-The VNNI kernels are 1.7x faster than the float-activation ones, and the
-step spends less time in kernels. It loses end to end on calls. Written in
-graph operations, the activation quantization fuses into 6 small kernels per
-quantized activation: 576 more per step, 895 in all against 319, and the
-runtime's Python loop does per-call work (pointer arrays, offsets) for each
-one. That cost is what phase 7 exists to remove, with one call per
-token. The other large cost is the float32 LM head, 545 MB a step in both
-modes, and most of the float32 matmul time. It stays float32 here by the
-roadmap's choice, matching the 23.3078 configuration; nanoinfer has since
-made int8 embeddings its default, for 0.02 points of perplexity.
+The VNNI projections are 1.25x faster, which is less than quantizing their
+activations costs. Written in graph operations, that quantization fuses into
+6 small kernels per quantized activation: 576 more calls a step, 895 in all
+against 319, each paying the runtime's per-call cost in Python, which adds
+about 3 ms more. Removing that cost is phase 7's job, with one call per
+token. The largest cost in both modes is the float32 LM head, 545 MB a step
+and most of the 30 ms of float32 matmuls. It stays float32 by the roadmap's
+choice; nanoinfer has since made int8 embeddings its default, for 0.02
+points of perplexity.
+
+**A first measurement was discarded.** Three runs the day before, on a
+machine with OneDrive, Defender and the search indexer holding about 28% of
+the CPU, put every engine at about twice the times above (fp32 at 124 to
+155 ms) and showed nanoinfer 4 to 15% ahead and VNNI's kernels 1.7x faster.
+With the load gone, both of those disappeared. The three records stay in
+`bench/results.jsonl`, marked.
 
 ```
 python -m bench.phase6 --part speed
